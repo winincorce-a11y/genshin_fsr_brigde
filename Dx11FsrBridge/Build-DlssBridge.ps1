@@ -20,9 +20,16 @@
 
 [CmdletBinding()]
 param(
-    # Root that holds the toolchain layout. Defaults to the parent of the folder
-    # containing this script, so no machine-specific path is baked in.
-    [string] $WorkspaceRoot = (Split-Path -Parent $PSScriptRoot),
+    # Root that holds the toolchain layout (a directory containing
+    # _vs\msvcroot and _msvc\sdkfull, see -ToolchainRoot below).
+    #
+    # Left empty on purpose: `$PSScriptRoot` is NOT yet bound while parameter
+    # default values are evaluated, so `Split-Path -Parent $PSScriptRoot` here
+    # throws ParameterArgumentValidationErrorEmptyStringNotAllowed when the
+    # script is invoked via `powershell -File`. Resolved after the param block.
+    [string] $WorkspaceRoot = "",
+    # Explicit toolchain root; overrides $WorkspaceRoot when non-empty.
+    [string] $ToolchainRoot = "",
     [switch] $Clean,
     # Value written to DlssInput in the generated ini. 0=off 1=auto 2=force.
     # Default 2 so a test build is actually testable without hand-editing an ini
@@ -39,11 +46,27 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
+# Resolve paths AFTER the param block ($PSScriptRoot is only bound from here on)
+# ---------------------------------------------------------------------------
+# $PSScriptRoot = <repo>\Dx11FsrBridge ; the repo root is its parent.
+$scriptRepoRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($ToolchainRoot)) {
+    if (-not [string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+        $ToolchainRoot = $WorkspaceRoot
+    } else {
+        $ToolchainRoot = Split-Path -Parent $scriptRepoRoot
+    }
+}
+$WorkspaceRoot = $ToolchainRoot
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-$repo       = Join-Path $WorkspaceRoot "genshin_fsr_brigde"
+# Source tree comes from the script location, NOT from $WorkspaceRoot: an
+# outsider may clone the repo anywhere while the toolchain lives elsewhere.
+$repo       = $scriptRepoRoot
 $src        = Join-Path $repo "Dx11FsrBridge"
-$toolRoot   = Join-Path $WorkspaceRoot "_vs"
+$toolRoot   = Join-Path $ToolchainRoot "_vs"
 $msvcRoot   = Join-Path $toolRoot "msvcroot\VC\Tools\MSVC\14.44.35207"
 $msvcBin    = Join-Path $msvcRoot "bin\Hostx64\x64"
 $sdkRoot    = Join-Path $WorkspaceRoot "_msvc\sdkfull\c"
