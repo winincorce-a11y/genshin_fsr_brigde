@@ -1,4 +1,9 @@
 #include <Windows.h>
+// `_ReturnAddress()`（HDR swapchain 冒充那三处钩子用它取调用方地址）声明在
+// <intrin.h> 里。此前本文件从未包含它，只是靠 <Windows.h> 在 MSVC 上的**隐式**
+// 传递包含侥幸编译通过 —— 换成任何严格一点的工具链（或 Windows SDK 调整头顺序）
+// 就会 C3861。显式包含，不依赖传递。
+#include <intrin.h>
 #include <TlHelp32.h>
 #include <d3d11.h>
 #include <d3d11_3.h>
@@ -15,6 +20,7 @@
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
+#include "DlssInput.h"
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
@@ -337,6 +343,37 @@ struct Config
     float ffx12_fov_scale = 1.0f;       // FOV 缩放（AA 重投影验证：1.0=45°）
     bool ffx12_jitter_delay = true;   // 2026-08-25 FSR4 实测：游戏双缓冲预录滞后一帧 → 用上一帧 jitter（jdelay=1）
     bool ffx12_force_reset = false;   // 诊断：每帧强制 FSR2 reset（与正常对比：相同=历史零贡献/单帧重建）
+    // ---- DLSS 输入路径（DlssInput.h / DLSS_INPUT.md）----
+    // mode：0=off（默认，全部走现有 ffx12 链路）1=auto（N 卡 + 能解析到 NGX 才切）
+    //       2=force（不管显卡，能解析到就切 —— 用于 A 卡 + OptiScaler 的 A/B）
+    int dlss_input_mode = 0;
+    std::uint32_t dlss_input_jitter_reduce = 0;
+    // 抖动符号约定（独立于 Ffx12JitterMode，见 jitter_mode_from_config 的说明）。
+    // 0=+n*W-0.5  1=+n*W  2=raw  3=-n*W+0.5（默认）4=-n*W  5=zero
+    std::uint32_t dlss_input_jitter_mode = 3;
+    // reactive mask 开关（motion.b 合成）。0=关（默认基线）1=开。
+    // 适用场景：低对比区域（白衣/白丝 vs 灰白地面）转动视角出拖影 ——
+    // DLSS 靠颜色差异判断历史可信度，低对比时误判 ⇒ 需显式告知"此处不可信"。
+    std::uint32_t dlss_input_reactive_mask = 0;
+    std::uint32_t dlss_input_motion_fixup = 0;  // 0=负 scale 1=要求原生符号纹理
+    // 运动矢量符号 A/B 开关（排障用）：0=负 scale（默认）1=正 scale 2=关闭 MV。
+    // 2 是**决定性诊断档**：若关闭后运动模糊消失，问题 100% 在 MV 链路；
+    // 若仍在，则与 MV 无关（mask/depth/jitter 方向）。
+    // 运动矢量 scale 符号：**1 = 正 scale 是正确值**（2026-11-10 实机确认）。
+    // 0=负(错误旧默认) 1=正(正确) 2=关闭MV(诊断) 3=原始纹理+正scale(诊断)
+    std::uint32_t dlss_input_motion_sign = 1;
+    // MV 数值探针（低频）：每 600 帧读回一次解码后的 MV 均值。
+    // 默认关（AGENTS.md §二.5：诊断默认关；每帧探针会吃掉帧数）。
+    bool dlss_input_mv_probe = false;
+    // jitter 来源探针：强制读 cb0 并对比 render 字段，判定谁在逐帧变化。
+    // 默认关；见 DlssInputJitterProbe。
+    bool dlss_input_jitter_probe = false;
+    // 深度值域归一化倍数。游戏逆深度实际约 [0, 0.03]，DLSS 期望 [0,1]
+    // ⇒ 需要约 32~33 倍放大。不归一化会导致前后景不可分 → 运动拖影
+    // （Ffx12Backend.cpp:456-457 对 FFX 路径已记录同一结论）。
+    float dlss_input_depth_scale = 32.0f;
+    std::wstring dlss_input_module = L"nvngx.dll";
+    bool dlss_input_allow_real_ngx = true;
     // 原生 D3D11 纯 GPU 传输（自建 D3D12 + NT 共享句柄 + D3D11.4 fence）。
     // 默认开：GpuInteropProbe 已在本机字节级验证；不劫持游戏设备为 On12（进场前冻结根因）。
     bool ffx12_gpu_interop = true;
@@ -576,6 +613,11 @@ static bool g_route_applied = false; // 路由已应用（防止设备补检重�
 // 路由信息（apply 时保存，焦点框首次成功/失败时输出，保证三行相邻）
 static std::string g_route_gpu_name;
 static std::string g_route_vendor_label;
+// 适配器 vendor id（0x10DE=NVIDIA / 0x1002=AMD / 0x8086=Intel）。
+// 存在的理由：DLSS 输入路由（见 dlss_gate::resolve_path）必须按厂商决策，
+// 而 `g_route_vendor_label` 是 "0x10DE" 这样的**字符串**，解析它去判断厂商既慢又脆。
+// 这里保存原始数值，只在 record_adapter_info 里写一次。
+static std::atomic<std::uint32_t> g_route_vendor_id { 0u };
 static std::string g_route_sdk_path;
 
 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5（像素/归一化），
@@ -4118,6 +4160,68 @@ void load_config()
         60000u);
     g_config.ffx12_single_instance_strict =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstanceStrictMatch", 0, config_path.c_str()) != 0;
+
+    // ---- DLSS 输入路径（DlssInput.h）----
+    // 与上面各键**并列**而不是替换：DLSS 输入只是把"喂给谁"换成 NVSDK_NGX，
+    // 输入抓取（draw 识别 / il2cpp token / 资源槽位）全部复用现有链路。
+    //
+    // ⚠️ `DlssInput` 的默认值是 **0（关）**，理由：
+    //   切到 NGX 输入意味着**换掉了所有已经调好的语义**（jitter 符号、MV 符号、
+    //   色彩空间、auto-exposure）。在 N 卡实机验证前默认打开 = 让 A 卡用户也承担
+    //   "被当 N 卡处理"的风险。要开就显式开，并看日志里的 `dlss_input_route` 一行。
+    g_config.dlss_input_mode = static_cast<int>(GetPrivateProfileIntW(
+        L"Dx11FsrBridge", L"DlssInput", 0, config_path.c_str())); // 0=off 1=auto 2=force
+    g_config.dlss_input_jitter_reduce = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputJitterReduce", 0, config_path.c_str())),
+        0u,
+        2u); // 0=wrap（默认，保多样性）1=clamp（复刻旧行为）2=none（诊断）
+    g_config.dlss_input_motion_fixup = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputMotionFixup", 0, config_path.c_str())),
+        0u,
+        1u); // 0=负 scale 抵消（默认）1=要求解码纹理改为原生符号
+    // 抖动符号约定：独立键，默认 3（与实机基线一致）。
+    g_config.dlss_input_jitter_mode = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputJitterMode", 3, config_path.c_str())),
+        0u,
+        5u);
+    // reactive mask 开关（默认 0=关，保持已验证基线）。
+    g_config.dlss_input_reactive_mask = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputReactiveMask", 0, config_path.c_str())),
+        0u,
+        1u);
+    g_config.dlss_input_motion_sign = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputMotionSign", 1, config_path.c_str())),
+        0u,
+        3u); // 0=负 scale（默认）1=正 scale 2=关闭 MV 3=原始纹理+正scale（复刻FFX）
+    // MV 数值探针：默认关。开启后每 600 帧读回一次，用于判定解码后的 MV
+    // 在静态/运动时的数值是否合理（此前对 MV 的结论全是推导，已被否决两次）。
+    g_config.dlss_input_mv_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputMvProbe", 0, config_path.c_str()) != 0;
+    // jitter 来源探针（诊断，默认关）。
+    g_config.dlss_input_jitter_probe =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputJitterProbe", 0, config_path.c_str()) != 0;
+    // 深度归一化倍数（整数读入后转 float，避免依赖 ini 浮点解析）。
+    // 默认 32：游戏逆深度 [0,~0.03] ⇒ 32 倍后覆盖 [0,~0.96]，落在 DLSS 期望的 [0,1]。
+    g_config.dlss_input_depth_scale = static_cast<float>(std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputDepthScale", 32, config_path.c_str())),
+        1u,
+        256u));
+    g_config.dlss_input_module = [] (const std::filesystem::path &config_path) -> std::wstring {
+        wchar_t buf[64] {};
+        GetPrivateProfileStringW(L"Dx11FsrBridge", L"DlssInputModule", L"nvngx.dll", buf,
+                                 static_cast<DWORD>(std::size(buf)), config_path.c_str());
+        return buf;
+    }(config_path);
+    // 没有 OptiScaler 时能否直接用 NVIDIA 原生 NGX 出 DLSS（= N 卡直出，不经 OptiScaler）。
+    g_config.dlss_input_allow_real_ngx =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssInputAllowRealNgx", 1, config_path.c_str()) != 0;
+
     // 后端侧同开关：池重建 / context 重建留痕（默认关；见 Ffx12Backend.h 的说明）
     ffx12::set_instance_diag(g_config.ffx12_single_instance_diag);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
@@ -10129,9 +10233,1155 @@ static std::size_t read_game_floats_seh(std::uint64_t ptr, float *out, std::size
     }
 }
 
+// ===========================================================================
+// DLSS 输入路由（DlssInput.h / DLSS_INPUT.md）
+// ===========================================================================
+//
+// 与 `ffx12::dispatch` **同级**的第二条输出路径：同一份抓取结果，喂给 NVSDK_NGX
+// 而不是 ffx-api。两条路径互斥（同一帧只走一条），但共用 draw 识别 / il2cpp token /
+// 资源槽位 / 归属裁决 —— 那些是"抓"，这里只决定"喂给谁"。
+//
+// 为什么路由放在这份文件而不是 DlssInput.cpp：
+//   显卡厂商、OptiScaler 是否在场、ngx 模块是否存在，都是**进程/环境**事实
+//   （需要 DXGI 适配器枚举、模块枚举），而 DlssInput.cpp 刻意零平台依赖以便单测。
+//   纯决策函数 `dlss_input::route_output` 仍在那边，这里只负责"喂输入"。
+namespace dlss_gate
+{
+std::atomic<int> g_path { -1 }; // -1=未决定 0=ffx 1=dlss；只决定一次（显卡不会中途变）
+std::atomic_bool g_init_attempted { false };
+std::atomic_bool g_init_ok { false };
+std::atomic_uint32_t g_eval_failures { 0 };
+std::atomic_uint64_t g_eval_total { 0 };
+dlss_input::Runtime g_runtime;
+std::mutex g_runtime_mutex; // ensure_feature 会重建 feature，必须串行
+
+dlss_input::Vendor vendor_from_current_device()
+{
+    // 复用桥已有的适配器信息（record_adapter_info 在设备创建钩子里已经拿到 vendor）。
+    // 这里刻意不重新枚举 DXGI：`try_fsr2_translation_draw` 在渲染线程上，
+    // CreateDXGIFactory 会带来可观的首次开销。
+    return dlss_input::Vendor::Unknown;
+}
+
+int resolve_path()
+{
+    const int cached = g_path.load(std::memory_order_relaxed);
+    if (cached >= 0)
+        return cached;
+
+    dlss_input::RouteInput in {};
+    const std::uint32_t vendor_id = g_route_vendor_id.load(std::memory_order_relaxed);
+    in.vendor = vendor_id == 0x10DE ? dlss_input::Vendor::Nvidia
+        : vendor_id == 0x1002      ? dlss_input::Vendor::Amd
+        : vendor_id == 0x8086      ? dlss_input::Vendor::Intel
+                                   : dlss_input::Vendor::Unknown;
+    in.optiscaler_present = GetModuleHandleW(L"OptiScaler.dll") != nullptr;
+    // ⚠️ "此刻已在进程里" ≠ "能否加载到"。OptiScaler 把 nvngx 的 LoadLibrary 在
+    // LdrLoadDll 层拦下并返回自身句柄 —— 那个模块在**加载之前当然不在模块列表里**。
+    // 所以这里除了已加载的名字，还要把各候选名都问一遍；真正的判定交给
+    // `ensure_initialized` 的 LoadLibraryW（失败会 fail-open 回 ffx）。
+    in.dlss_runtime_present = false;
+    for (const wchar_t *name : { g_config.dlss_input_module.c_str(), L"nvngx.dll",
+                                 L"_nvngx.dll", L"nvngx_dlss.dll" })
+    {
+        if (name != nullptr && name[0] != L'\0' && GetModuleHandleW(name) != nullptr)
+        {
+            in.dlss_runtime_present = true;
+            break;
+        }
+    }
+    in.user_preference = g_config.dlss_input_mode == 2 ? 1 : (g_config.dlss_input_mode == 0 ? 0 : -1);
+    // mode==1（auto）时把 preference 还原成 auto，避免被强制
+    if (g_config.dlss_input_mode == 1)
+        in.user_preference = -1;
+
+    const dlss_input::RouteOutput out = dlss_input::route_output(in);
+    const int path = out.path == dlss_input::OutputPath::DlssInput ? 1 : 0;
+    g_path.store(path, std::memory_order_relaxed);
+    LOG_INFO(blog::cat::upscale, std::string("dlss_input_route path=") +
+        (path == 1 ? "dlss" : "ffx") + " reason=" + out.reason +
+        " vendor=0x" + hex64(vendor_id) +
+        " optiscaler=" + std::to_string(in.optiscaler_present ? 1 : 0) +
+        " ngx=" + std::to_string(in.dlss_runtime_present ? 1 : 0) +
+        " mode=" + std::to_string(g_config.dlss_input_mode));
+    return path;
+}
+
+// 首次真正需要派发时才初始化（此时游戏设备一定已建好）。
+//
+// ⚠️ 实机崩溃（2026-11-09 16:31:36）与这里的**保护缺失**直接相关：
+//   崩溃栈 #05 Dx11FsrBridge+0x730D2 (Runtime::initialize) → #04 OptiScaler.dll+0x244D09，
+//   异常 0xC0000005 **READ address=0x15**（RAX=0x15 = 从一个值为 0x15 的函数指针跳过去）。
+//   也就是说：`LoadLibraryW("nvngx.dll")` 被 OptiScaler 的 LdrLoadDll 钩子拦下并返回了
+//   **它自己的句柄**，但那一刻 OptiScaler 自己还没完成 NGX 侧的初始化 —— 我们紧接着
+//   调 `NVSDK_NGX_D3D11_Init_with_ProjectID`，它内部走到一个未就绪的指针上就炸了。
+//   这一炸发生在渲染线程上，直接带走整个游戏进程（日志 0 字节 = 还没写第一条就死了）。
+//
+// 因此这里做三件事：
+//   1. **SEH 兜底**：NGX/OptiScaler 侧任何访问违例都只让本次初始化失败，不让进程崩。
+//      （这正是本项目 19 处 __try 的一贯纪律：探针失败必须 fail-open。）
+//   2. **不在这里 LoadLibrary 立即 Init**：先只解析模块与导出，Init 推迟到第一次
+//      真正派发（那时游戏的 D3D11 device 已存在，OptiScaler 也已完成自己的捕获）。
+//   3. 失败后**永久**回到 ffx（不重试），并留下可读原因。
+struct InitProbeResult
+{
+    bool ok = false;
+    bool crashed = false;
+    unsigned long crash_code = 0;
+};
+
+// 必须 noinline 且不含需要 C++ 展开的对象（MSVC 不允许同一函数混用 SEH 与对象析构）。
+__declspec(noinline) static bool init_ngx_guarded(dlss_input::Runtime &runtime,
+                                                  const dlss_input::RuntimeConfig &cfg,
+                                                  ID3D11Device *device,
+                                                  ID3D11DeviceContext *context,
+                                                  unsigned long *crash_code)
+{
+    __try
+    {
+        return runtime.initialize(cfg, device, context);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return false;
+    }
+}
+
+bool ensure_initialized(ID3D11Device *device, ID3D11DeviceContext *context)
+{
+    if (g_init_ok.load(std::memory_order_relaxed))
+        return true;
+    if (g_init_attempted.exchange(true, std::memory_order_relaxed))
+        return g_init_ok.load(std::memory_order_relaxed);
+
+    std::lock_guard lock(g_runtime_mutex);
+    dlss_input::RuntimeConfig rc {};
+    rc.module_hint = g_config.dlss_input_module;
+    rc.allow_real_ngx = g_config.dlss_input_allow_real_ngx;
+
+    unsigned long crash_code = 0;
+    const bool ok = init_ngx_guarded(g_runtime, rc, device, context, &crash_code);
+    g_init_ok.store(ok, std::memory_order_relaxed);
+    if (!ok)
+    {
+        // 失败是**可诊断的**：把原因写进日志，然后由调用方回退 ffx12（fail-open）。
+        std::string detail = g_runtime.error();
+        if (crash_code != 0)
+        {
+            char buf[64] {};
+            std::snprintf(buf, sizeof(buf), "ngx_crashed(0x%08lX)", crash_code);
+            detail = std::string(buf) + (detail.empty() ? "" : (" " + detail));
+        }
+        LOG_WARN(blog::cat::upscale, std::string("dlss_input_init_failed error=") + detail +
+            " missing=" + g_runtime.report().missing +
+            " impl=" + g_runtime.report().impl +
+            " module=" + g_runtime.report().module_name);
+        // 初始化失败 ⇒ 永久退回 ffx（不重试：每次派发都试会拖慢渲染线程）。
+        g_path.store(0, std::memory_order_relaxed);
+        return false;
+    }
+    LOG_INFO(blog::cat::upscale, std::string("dlss_input_init_ok impl=") +
+        g_runtime.report().impl + " module=" + g_runtime.report().module_name +
+        " path=" + g_runtime.report().module_path);
+    return true;
+}
+
+// 两个 SEH 包装。必须 noinline 且**不持有**需要 C++ 展开的对象（MSVC 不允许
+// 同一函数混用 SEH 与对象析构）——所以参数/返回值都是平凡类型，字符串在门外拼。
+__declspec(noinline) static bool ensure_feature_guarded(const dlss_input::Feature::Desc &desc,
+                                                        ID3D11DeviceContext *context,
+                                                        unsigned long *crash_code)
+{
+    __try
+    {
+        return g_runtime.ensure_feature(desc, context);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return false;
+    }
+}
+
+__declspec(noinline) static bool evaluate_guarded(ID3D11DeviceContext *context,
+                                                  const dlss_input::FrameParams &frame,
+                                                  const ffx12::FrameInput &in,
+                                                  bool bind_transparency_as_mask,
+                                                  ID3D11Texture2D *depth_override,
+                                                  ID3D11Texture2D *motion_override,
+                                                  ID3D11Texture2D *reactive_override,
+                                                  unsigned long *crash_code)
+{
+    __try
+    {
+        // mask 优先级：transparency（若有）> 从 motion.b 合成的 reactive。
+        // 后者是这条 pass 上**唯一**可得的 mask 源 —— 游戏这个 FSR2 合成 draw
+        // 根本没有 transparency 槽位（日志实测 7 个 SRV 全被 color/weights/depth/
+        // motion/flags/out 占满）。
+        ID3D11Resource *mask = nullptr;
+        if (bind_transparency_as_mask)
+            mask = reinterpret_cast<ID3D11Resource *>(in.transparency);
+        else if (reactive_override != nullptr)
+            mask = reinterpret_cast<ID3D11Resource *>(reactive_override);
+        // 深度：优先用提取后的 R32_FLOAT（见 run_depth_extract）。
+        ID3D11Resource *depth = depth_override != nullptr
+            ? reinterpret_cast<ID3D11Resource *>(depth_override)
+            : reinterpret_cast<ID3D11Resource *>(in.depth);
+        // 运动矢量：优先用**解码后**的 R16G16_FLOAT（见 run_motion_decode）。
+        // 直接把 R10G10B10A2 平方编码交给 DLSS 会让运动量级与符号全错 ⇒ 鬼影。
+        ID3D11Resource *motion = motion_override != nullptr
+            ? reinterpret_cast<ID3D11Resource *>(motion_override)
+            : reinterpret_cast<ID3D11Resource *>(in.motion);
+        return g_runtime.feature().evaluate(
+            g_runtime.api(), context, g_runtime.params(), frame,
+            reinterpret_cast<ID3D11Resource *>(in.color),
+            depth,
+            motion,
+            reinterpret_cast<ID3D11Resource *>(in.output_target), nullptr,
+            mask,
+            mask);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return false;
+    }
+}
+
+// ===========================================================================
+// 深度提取（DLSS 路径专用）
+// ===========================================================================
+// 【为什么必须做，以及为什么这是"右上角鬼影"的根因】
+//
+// 游戏的深度纹理是 `R32G8X24_TYPELESS`（DSV，D32_FLOAT_S8X24_UINT）。它不是
+// 可读的 R32_FLOAT 单通道纹理：
+//   · 一个 texel 占 8 字节，深度只在前 4 字节，后 4 字节是 stencil+padding；
+//   · TYPELESS 意味着"格式未定"，采样/读取方必须自己按正确的 view 解释。
+//
+// 桥的 FFX 路径早就知道这件事（Ffx12Backend.cpp:345/452）：
+//    "游戏 R32G8X24_TYPELESS 不可共享 → D3D11 CS 提取到共享 R32_FLOAT（FFX 期望格式）"
+//
+// 而 DLSS 输入路径早先直接把 `in.depth`（原始 TYPELESS 纹理）交给 NGX。
+// DLSS 按 R32_FLOAT 逐像素读，遇到 8 字节 stride 的 TYPELESS 表面时：
+//   · 深度值被错误解读（读到的是"每隔一个 texel"的混合数据）；
+//   · 远处的深度（天空/远景）误差最大 ⇒ dlssInput 的遮挡判断失效 ⇒
+//     **该被深度剔除的历史没被剔除** ⇒ 运动后残留旧画面 = 鬼影。
+// 症状位置（画面右上 = 远景天空）与这个机制完全吻合，而不是随机分布的。
+//
+// 这里复用与后端同一个提取式子：out = in.Load(x).x * depth_scale。
+struct DepthExtract
+{
+    ID3D11Texture2D *target = nullptr;
+    ID3D11UnorderedAccessView *uav = nullptr;
+    ID3D11ShaderResourceView *srv_in = nullptr;
+    ID3D11ComputeShader *cs = nullptr;
+    std::uint32_t w = 0, h = 0;
+    DXGI_FORMAT src_format = DXGI_FORMAT_UNKNOWN;
+    bool failed = false;
+};
+
+std::mutex g_depth_mutex;
+DepthExtract g_depth {};
+std::atomic_bool g_depth_logged { false };
+
+const char *k_depth_extract_hlsl = R"(
+cbuffer DepthParams : register(b0)
+{
+    float g_depth_scale;
+    float3 g_pad;
+};
+Texture2D<float4> in_depth : register(t0);
+RWTexture2D<float> out_depth : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    out_depth[id.xy] = in_depth.Load(int3(id.xy, 0)).x * g_depth_scale;
+}
+)";
+
+// 编译 + 建立目标/UAV/SRV。尺寸或源格式变化时重建。
+bool ensure_depth_extract(ID3D11Device *device, ID3D11Texture2D *src)
+{
+    D3D11_TEXTURE2D_DESC sd {};
+    src->GetDesc(&sd);
+    if (sd.Width == 0 || sd.Height == 0)
+        return false;
+
+    // 已经是单通道浮点 ⇒ 不需要提取（也避免无谓的 pass）。
+    // 这里**一定**要记日志：否则"深度格式本来是好的"与"提取失败"在日志里
+    // 看起来完全一样，下次排障又会从零开始猜。
+    if (sd.Format == DXGI_FORMAT_R32_FLOAT)
+    {
+        if (!g_depth_logged.exchange(true))
+            LOG_INFO(blog::cat::upscale,
+                "dlss_depth_extract_skipped src_fmt=R32_FLOAT (already ideal) size=" +
+                std::to_string(sd.Width) + "x" + std::to_string(sd.Height));
+        return false;
+    }
+
+    const bool need_recreate = g_depth.target == nullptr || g_depth.w != sd.Width ||
+                               g_depth.h != sd.Height || g_depth.src_format != sd.Format;
+    if (!need_recreate)
+        return g_depth.target != nullptr;
+
+    if (g_depth.uav) { g_depth.uav->Release(); g_depth.uav = nullptr; }
+    if (g_depth.target) { g_depth.target->Release(); g_depth.target = nullptr; }
+    g_depth.src_format = sd.Format;
+    g_depth.w = sd.Width;
+    g_depth.h = sd.Height;
+    g_depth.failed = false;
+
+    // 编译 CS（只在首次真正需要时做一次）。
+    if (g_depth.cs == nullptr)
+    {
+        ID3DBlob *code = nullptr;
+        ID3DBlob *err = nullptr;
+        const HRESULT hr = D3DCompile(k_depth_extract_hlsl, std::strlen(k_depth_extract_hlsl),
+                                      "dlss_depth_extract", nullptr, nullptr, "main", "cs_5_0",
+                                      0, 0, &code, &err);
+        if (err) err->Release();
+        if (FAILED(hr) || code == nullptr)
+        {
+            g_depth.failed = true;
+            LOG_WARN(blog::cat::upscale, "dlss_depth_cs_compile_failed hr=" + hex64(static_cast<std::uint64_t>(hr)));
+            return false;
+        }
+        const HRESULT ch = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                                      nullptr, &g_depth.cs);
+        code->Release();
+        if (FAILED(ch) || g_depth.cs == nullptr)
+        {
+            g_depth.failed = true;
+            LOG_WARN(blog::cat::upscale, "dlss_depth_cs_create_failed hr=" + hex64(static_cast<std::uint64_t>(ch)));
+            return false;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC td {};
+    td.Width = sd.Width;
+    td.Height = sd.Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &g_depth.target)) || g_depth.target == nullptr)
+    {
+        g_depth.failed = true;
+        LOG_WARN(blog::cat::upscale, "dlss_depth_target_create_failed size=" +
+            std::to_string(sd.Width) + "x" + std::to_string(sd.Height));
+        return false;
+    }
+    if (FAILED(device->CreateUnorderedAccessView(g_depth.target, nullptr, &g_depth.uav)))
+    {
+        g_depth.failed = true;
+        return false;
+    }
+    if (!g_depth_logged.exchange(true))
+    {
+        LOG_INFO(blog::cat::upscale, "dlss_depth_extract_ready src_fmt=" + std::to_string(static_cast<std::uint32_t>(sd.Format)) +
+            " size=" + std::to_string(sd.Width) + "x" + std::to_string(sd.Height) +
+            " scale=" + std::to_string(g_config.dlss_input_depth_scale) +
+            " (game reverse-z range is ~[0,0.03]; needs ~32x to fill [0,1])");
+    }
+    return true;
+}
+
+// 把 src 提取到 g_depth.target。成功返回 target，否则 nullptr（调用方回退原纹理）。
+ID3D11Texture2D *run_depth_extract(ID3D11Device *device, ID3D11DeviceContext *context,
+                                   ID3D11Texture2D *src)
+{
+    if (src == nullptr || !ensure_depth_extract(device, src))
+        return nullptr;
+
+    // ⚠️ **深度归一化（2026-11-09 修复"运动拖影"的关键）**
+    //
+    // FFX 后端早有这一步，注释写得很清楚（Ffx12Backend.cpp:456-457）：
+    //   "游戏逆深度实际 [0, ~0.03]。不归一化则 深度感知/低分辨率 MV 上采样失真
+    //    → 视角移动残影。"
+    //
+    // 我最初实现深度提取时用了 `scale = 1.0f`，等于**没归一化** ——
+    // 游戏逆深度值域只有 [0, 0.03]，DLSS 收到一张几乎全黑的深度图，
+    // 前后景在数值上几乎不可分 ⇒ 把背景整片当同一平面累积历史
+    // ⇒ **运动中大面积拖影**，而近景（角色）因为深度值相对较大反而正常
+    // —— 与实机截图"角色清晰、背景发灰发虚"完全一致。
+    //
+    // 缩放倍数由 ini 控制（默认 32，约等于 1/0.03 ≈ 33）；
+    // 不硬编码 1/0.03，是因为它依赖游戏相机 near/far，版本间可能变。
+    const float scale = g_config.dlss_input_depth_scale;
+    ID3D11Buffer *cb = nullptr;
+    D3D11_BUFFER_DESC bd {};
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA init {};
+    float params[4] { scale, 0.0f, 0.0f, 0.0f };
+    init.pSysMem = params;
+    if (FAILED(device->CreateBuffer(&bd, &init, &cb)))
+        return nullptr;
+
+    // 源 SRV：TYPELESS 必须显式挑一个可读的 cast 格式。深度用 R32_FLOAT 读前 4 字节。
+    D3D11_SHADER_RESOURCE_VIEW_DESC svd {};
+    svd.Format = DXGI_FORMAT_R32_FLOAT;
+    svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    svd.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView *srv = nullptr;
+    if (FAILED(device->CreateShaderResourceView(src, &svd, &srv)) || srv == nullptr)
+    {
+        cb->Release();
+        return nullptr;
+    }
+
+    context->CSSetShader(g_depth.cs, nullptr, 0);
+    context->CSSetConstantBuffers(0, 1, &cb);
+    context->CSSetShaderResources(0, 1, &srv);
+    context->CSSetUnorderedAccessViews(0, 1, &g_depth.uav, nullptr);
+    context->Dispatch((g_depth.w + 7) / 8, (g_depth.h + 7) / 8, 1);
+
+    // 解绑：UAV 必须先解绑才能被当成 SRV 读（否则运行时警告/未定义行为）。
+    ID3D11UnorderedAccessView *null_uav = nullptr;
+    context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    ID3D11ShaderResourceView *null_srv = nullptr;
+    context->CSSetShaderResources(0, 1, &null_srv);
+    ID3D11Buffer *null_cb = nullptr;
+    context->CSSetConstantBuffers(0, 1, &null_cb);
+    context->CSSetShader(nullptr, nullptr, 0);
+
+    srv->Release();
+    cb->Release();
+    return g_depth.target;
+}
+
+// ===========================================================================
+// 运动矢量解码（DLSS 路径专用）—— 右上角鬼影的直接根因
+// ===========================================================================
+// 游戏的运动矢量纹理是 `R10G10B10A2_UNORM`（日志实测 `f23`），内容为**平方编码**：
+//     d  = raw - 0.498039
+//     mv = -sign(d) * 4 * d²
+// （Ffx12Backend.cpp:498-499，游戏 accumulate shader 反汇编实证）
+//
+// FFX 路径一直有这一步：D3D11 CS 把 R10G10B10A2 解码成 R16G16_FLOAT 再交给 SDK
+// （Ffx12Backend.cpp:475-478 的 g_motion_decode_d11_hlsl）。
+//
+// 而 DLSS 输入路径早先**直接把原始纹理交出去**。DLSS 按线性 UNORM 读 →
+//   · 小运动被平方律压得更小（本该是 d 的地方读到的是 d²/4 的量级）；
+//   · 符号只由 raw 是否 < 0.498 决定，跨越中性点时方向整片翻错。
+// 结果：DLSS 朝错误位置采样历史 ⇒ 运动后残留旧内容 = 鬼影。
+//
+// 为什么鬼影集中在**画面右上（远景天空）**：那里 MV 最接近 0，
+// 平方编码的相对误差最大（d 很小 ⇒ d 与 d²/4 差几个数量级），
+// 而天空又是大面积低频内容、历史最容易"看起来还像"，所以错误累积最明显。
+struct MotionDecode
+{
+    ID3D11Texture2D *target = nullptr;
+    ID3D11UnorderedAccessView *uav = nullptr;
+    // reactive 输出：与解码后的 MV 同尺寸的 R8_UNORM（motion.b 通道）。
+    // 这是 DLSS 路径唯一的 mask 来源（transparency 槽位在这个 pass 上不存在）。
+    ID3D11Texture2D *reactive = nullptr;
+    ID3D11UnorderedAccessView *reactive_uav = nullptr;
+    ID3D11ComputeShader *cs = nullptr;
+    std::uint32_t w = 0, h = 0;
+    DXGI_FORMAT src_format = DXGI_FORMAT_UNKNOWN;
+    bool logged = false;
+};
+
+std::mutex g_mv_mutex;
+MotionDecode g_mv {};
+std::atomic_bool g_mv_logged { false };
+
+// g_flip = +1：保持游戏原生方向（解码已含负号，语义是"history = uv - mv"）。
+const char *k_motion_decode_hlsl = R"(
+cbuffer MotionParams : register(b0)
+{
+    float g_flip;
+    float3 g_pad;
+};
+Texture2D<float4> in_mv : register(t0);
+RWTexture2D<float2> out_mv : register(u0);
+RWTexture2D<float> out_reactive : register(u1);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    float4 c = in_mv.Load(int3(id.xy, 0));
+    float2 d = c.rg - 0.498039;
+    float2 mv = -sign(d) * (4.0 * d * d) * g_flip;
+    out_mv[id.xy] = mv;
+    // reactive mask：取 motion 的 B 通道。
+    // 依据（Ffx12Backend.cpp:509，游戏 motion.bits20..29 实证）：
+    //   motion 的 B 通道承载了"该像素的时域不可靠度"（动态物件/特效覆盖），
+    //   FFX 路径一直用它合成 reactive；DLSS 路径此前完全没绑 mask，
+    //   于是半透明与快速运动区域被当成刚性几何持续累积历史 ⇒ K（CNN 型，
+    //   对 mask 极敏感）在运动中大面积拖影，而 M/L（transformer 型）相对耐受。
+    //   这与用户观察到的"K 拖影、M/L 只是锯齿"完全吻合。
+    out_reactive[id.xy] = c.b;
+}
+)";
+
+bool ensure_motion_decode(ID3D11Device *device, ID3D11Texture2D *src)
+{
+    D3D11_TEXTURE2D_DESC sd {};
+    src->GetDesc(&sd);
+    if (sd.Width == 0 || sd.Height == 0)
+        return false;
+
+    // 已经是双通道浮点 ⇒ 不需要解码（也说明来源不是平方编码纹理）。
+    if (sd.Format == DXGI_FORMAT_R16G16_FLOAT || sd.Format == DXGI_FORMAT_R32G32_FLOAT)
+    {
+        if (!g_mv_logged.exchange(true))
+            LOG_INFO(blog::cat::upscale, "dlss_mv_decode_skipped src_fmt=" +
+                std::to_string(static_cast<std::uint32_t>(sd.Format)) + " (already float2)");
+        return false;
+    }
+
+    const bool need_recreate = g_mv.target == nullptr || g_mv.w != sd.Width ||
+                               g_mv.h != sd.Height || g_mv.src_format != sd.Format;
+    if (!need_recreate)
+        return g_mv.target != nullptr;
+
+    // 尺寸变化必须记录：否则"解码器还停在启动分辨率"这件事在日志里完全不可见，
+    // 而它的后果是 MV 纹理被按错误尺寸解码/采样 —— 运动中大面积拖影或锯齿。
+    if (g_mv.target != nullptr && (g_mv.w != sd.Width || g_mv.h != sd.Height))
+    {
+        LOG_INFO(blog::cat::upscale, "dlss_mv_decode_resize " +
+            std::to_string(g_mv.w) + "x" + std::to_string(g_mv.h) + " -> " +
+            std::to_string(sd.Width) + "x" + std::to_string(sd.Height));
+    }
+
+    if (g_mv.uav) { g_mv.uav->Release(); g_mv.uav = nullptr; }
+    if (g_mv.target) { g_mv.target->Release(); g_mv.target = nullptr; }
+    g_mv.src_format = sd.Format;
+    g_mv.w = sd.Width;
+    g_mv.h = sd.Height;
+
+    if (g_mv.cs == nullptr)
+    {
+        ID3DBlob *code = nullptr;
+        ID3DBlob *err = nullptr;
+        const HRESULT hr = D3DCompile(k_motion_decode_hlsl, std::strlen(k_motion_decode_hlsl),
+                                      "dlss_motion_decode", nullptr, nullptr, "main", "cs_5_0",
+                                      0, 0, &code, &err);
+        if (err) err->Release();
+        if (FAILED(hr) || code == nullptr)
+        {
+            LOG_WARN(blog::cat::upscale, "dlss_mv_cs_compile_failed hr=" + hex64(static_cast<std::uint64_t>(hr)));
+            return false;
+        }
+        const HRESULT ch = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                                      nullptr, &g_mv.cs);
+        code->Release();
+        if (FAILED(ch) || g_mv.cs == nullptr)
+        {
+            LOG_WARN(blog::cat::upscale, "dlss_mv_cs_create_failed hr=" + hex64(static_cast<std::uint64_t>(ch)));
+            return false;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC td {};
+    td.Width = sd.Width;
+    td.Height = sd.Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &g_mv.target)) || g_mv.target == nullptr)
+    {
+        LOG_WARN(blog::cat::upscale, "dlss_mv_target_create_failed");
+        return false;
+    }
+    if (FAILED(device->CreateUnorderedAccessView(g_mv.target, nullptr, &g_mv.uav)))
+        return false;
+
+    // reactive（R8_UNORM）：同一张 CS 的 u1 输出，源是 motion.b。
+    if (g_mv.reactive_uav) { g_mv.reactive_uav->Release(); g_mv.reactive_uav = nullptr; }
+    if (g_mv.reactive) { g_mv.reactive->Release(); g_mv.reactive = nullptr; }
+    D3D11_TEXTURE2D_DESC rd {};
+    rd.Width = sd.Width;
+    rd.Height = sd.Height;
+    rd.MipLevels = 1;
+    rd.ArraySize = 1;
+    rd.Format = DXGI_FORMAT_R8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Usage = D3D11_USAGE_DEFAULT;
+    rd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(device->CreateTexture2D(&rd, nullptr, &g_mv.reactive)) && g_mv.reactive != nullptr)
+    {
+        if (FAILED(device->CreateUnorderedAccessView(g_mv.reactive, nullptr, &g_mv.reactive_uav)))
+        {
+            g_mv.reactive_uav = nullptr;
+        }
+    }
+    if (!g_mv_logged.exchange(true))
+        LOG_INFO(blog::cat::upscale, "dlss_mv_decode_ready src_fmt=" +
+            std::to_string(static_cast<std::uint32_t>(sd.Format)) + " size=" +
+            std::to_string(sd.Width) + "x" + std::to_string(sd.Height) +
+            " reactive=" + (g_mv.reactive_uav != nullptr ? "on" : "off"));
+    return true;
+}
+
+ID3D11Texture2D *run_motion_decode(ID3D11Device *device, ID3D11DeviceContext *context,
+                                   ID3D11Texture2D *src, std::uint32_t expect_w,
+                                   std::uint32_t expect_h)
+{
+    if (src == nullptr || !ensure_motion_decode(device, src))
+        return nullptr;
+
+    // ⚠️ 尺寸一致性校验（实机踩过）：解码输出是 `src` 的尺寸，而 `mv_scale` 用的是
+    // 当前帧的 render_w/render_h。两者不一致时（渲染精度切换的过渡帧，或桥抓到的是
+    // 上一档分辨率的旧纹理）继续解码会让 DLSS 拿到"尺寸与 scale 不匹配"的运动矢量
+    // ⇒ 运动中大面积拖影。宁可不解码、明确记账，也不要带着错量纲继续跑。
+    if (expect_w != 0 && expect_h != 0 && (g_mv.w != expect_w || g_mv.h != expect_h))
+    {
+        static std::atomic_uint32_t mismatch_count { 0 };
+        const std::uint32_t mc = mismatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (mc <= 4 || mc % 512 == 0)
+            LOG_WARN(blog::cat::upscale, "dlss_mv_size_mismatch count=" + std::to_string(mc) +
+                " tex=" + std::to_string(g_mv.w) + "x" + std::to_string(g_mv.h) +
+                " render=" + std::to_string(expect_w) + "x" + std::to_string(expect_h) +
+                " (skipping decode)");
+        return nullptr;
+    }
+
+    ID3D11Buffer *cb = nullptr;
+    D3D11_BUFFER_DESC bd {};
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA init {};
+    float params[4] { 1.0f, 0.0f, 0.0f, 0.0f }; // g_flip = +1（保持游戏方向）
+    init.pSysMem = params;
+    if (FAILED(device->CreateBuffer(&bd, &init, &cb)))
+        return nullptr;
+
+    // 源 SRV：R10G10B10A2_UNORM 直接按 UNORM 读，shader 里做平方解码。
+    D3D11_SHADER_RESOURCE_VIEW_DESC svd {};
+    svd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    svd.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView *srv = nullptr;
+    if (FAILED(device->CreateShaderResourceView(src, &svd, &srv)) || srv == nullptr)
+    {
+        cb->Release();
+        return nullptr;
+    }
+
+    context->CSSetShader(g_mv.cs, nullptr, 0);
+    context->CSSetConstantBuffers(0, 1, &cb);
+    context->CSSetShaderResources(0, 1, &srv);
+    // u0 = 解码后的 MV，u1 = reactive（motion.b）。两者同一次 dispatch 写出。
+    ID3D11UnorderedAccessView *uavs[2] { g_mv.uav, g_mv.reactive_uav };
+    const UINT uav_slots = (g_mv.reactive_uav != nullptr) ? 2u : 1u;
+    context->CSSetUnorderedAccessViews(0, uav_slots, uavs, nullptr);
+    context->Dispatch((g_mv.w + 7) / 8, (g_mv.h + 7) / 8, 1);
+
+    ID3D11UnorderedAccessView *null_uavs[2] { nullptr, nullptr };
+    context->CSSetUnorderedAccessViews(0, uav_slots, null_uavs, nullptr);
+    ID3D11ShaderResourceView *null_srv = nullptr;
+    context->CSSetShaderResources(0, 1, &null_srv);
+    ID3D11Buffer *null_cb = nullptr;
+    context->CSSetConstantBuffers(0, 1, &null_cb);
+    context->CSSetShader(nullptr, nullptr, 0);
+
+    srv->Release();
+    cb->Release();
+
+    // ---- MV 数值探针（低频、默认关，见 AGENTS.md §二.5 热路径红线）----
+    // 目的：判定"MV 解码后的数值是否合理"。静态场景应接近 0，运动时应显著非 0；
+    // 若静态也远离 0（或运动时恒为 0），说明解码式/偏置值不适用于当前游戏版本。
+    // 这是唯一能**测量**MV 正确性的手段 —— 此前所有关于 MV 的结论都是推导，
+    // 而推导已被实机否决过两次（见 DEV-CHANGELOG.local.md 的 F1）。
+    // 注入点选在 decode 之后：探针读的是**送给 DLSS 的那一份**，不是源纹理。
+    if (g_config.dlss_input_mv_probe)
+    {
+        static std::atomic_uint64_t probe_count { 0 };
+        const std::uint64_t pc = probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (pc <= 2 || pc % 600 == 0)
+        {
+            ID3D11Texture2D *staging = nullptr;
+            D3D11_TEXTURE2D_DESC sd2 {};
+            g_mv.target->GetDesc(&sd2);
+            sd2.Usage = D3D11_USAGE_STAGING;
+            sd2.BindFlags = 0;
+            sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (SUCCEEDED(device->CreateTexture2D(&sd2, nullptr, &staging)) && staging != nullptr)
+            {
+                context->CopyResource(staging, g_mv.target);
+                context->Flush();
+                D3D11_MAPPED_SUBRESOURCE m {};
+                if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &m)) && m.pData != nullptr)
+                {
+                    // 采样 9 个点（中心 + 四角附近），避免只看一个像素被局部干扰
+                    const auto *row = static_cast<const std::uint16_t *>(m.pData);
+                    const UINT pitch_f2 = m.RowPitch / 4; // R16G16_FLOAT = 4 B/texel
+                    float mx = 0.0f, my = 0.0f;
+                    int n = 0;
+                    for (int gy = 1; gy <= 3; ++gy)
+                    {
+                        for (int gx = 1; gx <= 3; ++gx)
+                        {
+                            const UINT px = g_mv.w * static_cast<UINT>(gx) / 4;
+                            const UINT py = g_mv.h * static_cast<UINT>(gy) / 4;
+                            const UINT idx = py * pitch_f2 + px * 2;
+                            const auto hx = row[idx];
+                            const auto hy = row[idx + 1];
+                            // 半精度 → float（F16C 不一定可用，用手算）
+                            auto h2f = [](std::uint16_t h) -> float {
+                                const std::uint32_t s = (h >> 15) & 1u;
+                                const std::uint32_t e = (h >> 10) & 0x1Fu;
+                                const std::uint32_t f = h & 0x3FFu;
+                                float v;
+                                if (e == 0)
+                                    v = (f == 0) ? 0.0f : (std::ldexp(static_cast<float>(f), -24));
+                                else if (e == 31)
+                                    v = (f == 0) ? INFINITY : NAN;
+                                else
+                                    v = std::ldexp(1.0f + static_cast<float>(f) / 1024.0f,
+                                                   static_cast<int>(e) - 15);
+                                return s ? -v : v;
+                            };
+                            mx += h2f(hx);
+                            my += h2f(hy);
+                            ++n;
+                        }
+                    }
+                    if (n > 0)
+                    {
+                        LOG_INFO(blog::cat::upscale,
+                            "dlss_mv_probe n=" + std::to_string(pc) +
+                            " mean=(" + std::to_string(mx / static_cast<float>(n)) + "," +
+                            std::to_string(my / static_cast<float>(n)) + ")" +
+                            " size=" + std::to_string(g_mv.w) + "x" + std::to_string(g_mv.h) +
+                            " (expect ~0 when static, non-zero when moving)");
+                    }
+                    context->Unmap(staging, 0);
+                }
+                staging->Release();
+            }
+        }
+    }
+
+    return g_mv.target;
+}
+
+// reactive 纹理（R8_UNORM，motion.b 通道）。与 run_motion_decode 同一次 dispatch 写出，
+// 所以调用方应在 run_motion_decode 之后立刻取。没有则返回 nullptr（调用方如实不绑）。
+ID3D11Texture2D *motion_decoded_reactive()
+{
+    return g_mv.reactive;
+}
+
+dlss_input::JitterReduce reduce_from_config()
+{
+    // 0 = PhaseScaled（默认）：相位域映射，保抖动序列的连续性与多样性。
+    // 1 = Wrap（旧默认）：像素域折返，会把 Halton 相位打散成稀疏格点（32 帧仅 9 种），
+    //     这是 DLSS M/L 上线条规律抖动的直接来源 —— 保留它只为 A/B 对照。
+    // 2 = Clamp：桥最早的行为（几乎恒定），仅诊断。
+    // 3 = None：不处理原始量级（会超界），仅诊断。
+    switch (g_config.dlss_input_jitter_reduce)
+    {
+    case 1:
+        return dlss_input::JitterReduce::Wrap;
+    case 2:
+        return dlss_input::JitterReduce::Clamp;
+    case 3:
+        return dlss_input::JitterReduce::None;
+    default:
+        return dlss_input::JitterReduce::PhaseScaled;
+    }
+}
+
+dlss_input::JitterMode jitter_mode_from_config()
+{
+    // 抖动符号约定 —— **必须独立于 Ffx12JitterMode**。
+    //
+    // 为什么不能共用：FSR2/FFX 的 jitter 语义是
+    //     samplePos = pixelPos + jitterOffset          （FFX 文档）
+    // 而 NGX 的 `Jitter.Offset` 语义是
+    //     "本帧相机投影相对**上一帧**的亚像素位移"，方向与 FFX 相反。
+    // 共用同一个开关会让"改 DLSS 的符号"顺带改坏 FFX 路径，
+    // 违反单变量原则（AGENTS.md §一.4），出问题无法归因。
+    //
+    // 键值语义（DlssInputJitterMode）：沿用 Ffx12JitterMode 的编号，
+    // 默认 3 = ZeroCentred（当前实机基线：M/L 抖动已明显改善）。
+    // 若出现"抗锯齿完全失效 + 鬼影位置漂移"，先试 0（符号反转）。
+    switch (g_config.dlss_input_jitter_mode)
+    {
+    case 0:
+        return dlss_input::JitterMode::PlusMinusHalf;
+    case 1:
+        return dlss_input::JitterMode::Positive;
+    case 2:
+        return dlss_input::JitterMode::Raw;
+    case 4:
+        return dlss_input::JitterMode::Negative;
+    case 5:
+        return dlss_input::JitterMode::Zero;
+    case 3:
+    default:
+        return dlss_input::JitterMode::ZeroCentred;
+    }
+}
+
+// 一次派发。返回 false ⇒ 调用方回退 ffx12（fail-open，绝不黑屏）。
+// 只收 context：device 由 `context->GetDevice()` 取（NGX 的 Init 需要它，
+// 而 dispatch 现场只有 immediate context）。
+bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
+              std::uint32_t display_w, std::uint32_t display_h, float norm_jx, float norm_jy,
+              const float prev_norm[2], bool first_frame, std::uint64_t ms_since_last)
+{
+    ID3D11Device *device = nullptr;
+    context->GetDevice(&device);
+    if (device == nullptr)
+        return false;
+    // GetDevice 会 AddRef；本函数所有返回路径统一 Release（见下面的 guard）。
+    struct DeviceGuard
+    {
+        ID3D11Device *d;
+        ~DeviceGuard() { if (d != nullptr) d->Release(); }
+    } device_guard { device };
+
+    if (!ensure_initialized(device, context))
+        return false;
+
+    const std::uint64_t n = g_eval_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1)
+    {
+        LOG_INFO(blog::cat::upscale,
+            "dlss_input_first_dispatch render=" + std::to_string(in.render_w) + "x" +
+            std::to_string(in.render_h) + " display=" + std::to_string(display_w) + "x" +
+            std::to_string(display_h));
+    }
+    // ---- output 纹理描述符探针（诊断"开 RCAS 就黑屏"）----
+    // OptiScaler 启用 RCAS 时会把 NGX 的 `Output` 从游戏纹理换成它自己的缓冲，
+    // 而那个缓冲是**照抄游戏纹理 desc** 再创建的
+    // （Shader_Dx11.cpp:62 CreateBufferResourceCommon → CreateTexture2D，仅追加
+    //  D3D11_BIND_UNORDERED_ACCESS）。只要 desc 里有任何"不可重建"的组合
+    // （MISC_SHARED、Mip/Array > 1、Usage=DYNAMIC 等），CreateTexture2D 就会失败
+    // ⇒ pipeline 的 input/output 双双为 null ⇒ 不 dispatch ⇒ **画面全黑**。
+    // 把决定成败的字段一次打全，用实测替代推断（AGENTS.md §一.6）。
+    {
+        static std::atomic_bool desc_logged { false };
+        if (!desc_logged.exchange(true, std::memory_order_relaxed) &&
+            in.output_target != nullptr)
+        {
+            D3D11_TEXTURE2D_DESC od {};
+            in.output_target->GetDesc(&od);
+            LOG_INFO(blog::cat::upscale,
+                "dlss_output_desc fmt=" + std::to_string(static_cast<std::uint32_t>(od.Format)) +
+                " " + std::to_string(od.Width) + "x" + std::to_string(od.Height) +
+                " mip=" + std::to_string(od.MipLevels) +
+                " array=" + std::to_string(od.ArraySize) +
+                " sample=" + std::to_string(od.SampleDesc.Count) +
+                " usage=" + std::to_string(static_cast<std::uint32_t>(od.Usage)) +
+                " bind=0x" + hex64(od.BindFlags) +
+                " cpu=0x" + hex64(od.CPUAccessFlags) +
+                " misc=0x" + hex64(od.MiscFlags) +
+                " | RCAS recreates this desc + UAV; mip/array/shared/dynamic => create fails => black");
+        }
+    }
+
+    // 纯映射层：一块只做语义换算的数据，便于日志逐字段对账。
+    dlss_input::FrameSpec spec {};
+    spec.render_w = in.render_w;
+    spec.render_h = in.render_h;
+    spec.display_w = display_w;
+    spec.display_h = display_h;
+    spec.norm_jitter_x = norm_jx;
+    spec.norm_jitter_y = norm_jy;
+    spec.prev_norm_jitter_x = prev_norm[0];
+    spec.prev_norm_jitter_y = prev_norm[1];
+    spec.jitter_mode = jitter_mode_from_config();
+    spec.jitter_reduce = reduce_from_config();
+    // ⚠️ **回退（2026-11-09 实机否决）**：曾改成自生成 Halton 序列。
+    //
+    // 为什么必须回退：DLSS 的 `Jitter.Offset` **必须精确等于游戏实际施加到投影
+    // 矩阵上的抖动**。它靠这个值反推"本帧从哪个亚像素位置采样"，从而把上一帧
+    // 的历史对齐过来。凭空生成一个游戏从未施加的序列，等于每帧都让 DLSS 去
+    // **错误位置**找历史 ⇒ 拖影/模糊显著加重（实机已证实）。
+    //
+    // 这条约束比"相位是否冻结"重要得多：即使游戏字段更新慢，它至少是**真值**；
+    // 自生成的是假值。所以这里回到使用游戏字段。
+    spec.jitter_semantics = dlss_input::JitterInput::NormSemantics::HaltonOverSize;
+    spec.jitter_frame_index = 0;
+    // ⚠️ **关键修复（2026-11-09，实机探针数据驱动）**
+    //
+    // `dlss_jitter_probe` 实测：游戏只施加**两个交替相位**
+    //   相位A: halton(0.874, 0.555)   相位B: halton(0.749, 0.111)
+    //   差值:  像素 (0.125, 0.444)  ← Y 接近半像素
+    // 且 render 字段与 cb0 **完全相同**（⇒ 没读错字段；改用 cb0 无收益）。
+    //
+    // 这正是桥 `Ffx12JitterDelay` 注释所说的"游戏双缓冲预录滞后一帧"：
+    // 画面是用**上一帧**的相位采样出来的，而本帧字段已经是**下一帧**的值。
+    // ffx 路径一直有这个补偿（`use_jx = delay ? prev_jx : jit_src_x`，默认开启），
+    // 而我的 DLSS 路径曾把它写死为 false ⇒
+    // **每帧给 DLSS 报了偏半个相位的 jitter** ⇒ 历史采样系统偏移 ⇒ 运动中拖影。
+    //
+    // 因此这里必须跟随 `Ffx12JitterDelay`（默认 true = 用上一帧）。
+    spec.jitter_from_cb0 = g_config.ffx12_jitter_delay;
+    // 桥的解码结果已经是 FSR2 语义（解码时取负）⇒ 需要**正** scale。
+    //
+    // 实机定论（2026-11-10，用户确认 K/M/L 画面与 FFX 输入持平）：
+    //   解码式 `-sign(d)*4d²` 已取过一次负 ⇒ 纹理是 **-mv_g**。
+    //   NGX 语义 prev = uv - mv*scale ⇒ uv - (-mv_g)*s = uv + mv_g*s。
+    //   要让 history = uv - mv_g，必须 s = **+1**。
+    //   此前用 -1 等于把方向又翻一次，历史朝反方向采样 ⇒ 一动就大面积拖影。
+    //
+    // 默认值取自 ini 的 `DlssInputMotionSign`（模板默认 1）。
+    spec.motion_sign = dlss_input::MotionTextureSign::Fsr2Negated;
+    spec.motion_fixup = g_config.dlss_input_motion_fixup == 1
+        ? dlss_input::MotionFixup::RequireNativeSign
+        : dlss_input::MotionFixup::UseNegativeScale;
+    // A/B 覆盖（排障用，见 ini 的 DlssInputMotionSign）：
+    //   1 = 强制正 scale（与推导相反，用于验证"方向反了"这一假说）
+    //   2 = 彻底关闭 MV（scale=0），决定性诊断档
+    //   3 = **原始纹理 + 正 scale**（完全复刻 FFX/FSR2 输入路径的 MV 组合）
+    if (g_config.dlss_input_motion_sign == 1)
+        spec.motion_fixup = dlss_input::MotionFixup::RequireNativeSign;
+    if (g_config.dlss_input_motion_sign == 3)
+        spec.motion_fixup = dlss_input::MotionFixup::RequireNativeSign;
+    spec.motion_disabled = (g_config.dlss_input_motion_sign == 2);
+    // 实机观察（2026-11-09）：设 2（关闭 MV）会让**大部分画面变灰**。
+    // 这是该档位的**预期行为**，不是新缺陷：MV scale=0 时 DLSS 认为所有像素
+    // 静止，于是每帧都在同一位置累积历史 —— 静态区域会越叠越糊、对比度被抹平。
+    // 它作为诊断档的价值仅在于"模糊是否消失"，不能当正常配置用。
+    if (spec.motion_disabled)
+    {
+        static std::atomic_bool warned { false };
+        if (!warned.exchange(true, std::memory_order_relaxed))
+            LOG_WARN(blog::cat::upscale,
+                "dlss_input_motion_disabled=1 (diagnostic only): DLSS treats every pixel as "
+                "static; expect washed-out/grey image by design.");
+    }
+    spec.have_exposure_texture = false; // 桥没有 1x1 exposure（FFX 侧靠 AUTO_EXPOSURE）
+    spec.sharpening = in.enable_sharpening;
+    spec.sharpness = in.sharpness;
+    spec.frame_time_ms = in.frame_time_delta_ms;
+    spec.camera_near = in.camera_near;
+    spec.camera_far = in.camera_far;
+    spec.camera_fov_vertical = in.camera_fov_vertical;
+    spec.reset_forced = in.reset && !first_frame;
+    spec.reset_first_frame = first_frame;
+    spec.ms_since_last_dispatch = ms_since_last;
+    // ---- mask 规划 ----
+    // ⚠️ 与 ffx 路径的关键区别：ffx 的 reactive 是**后端内部**从 motion.b 合成的
+    // （Ffx12Backend.cpp:509），而 NGX 只有一个 mask 槽位（Bias.Current.Color.Mask），
+    // 且 OptiScaler 对 DLSS 后端**原样透传**（IFeature_Dx11.cpp:34
+    //  "DLSS/DLSSD take the bias mask as is"）。
+    //
+    // 桥抓到的 `in.transparency` 是游戏原生 T4 合成蒙版（半透明/粒子覆盖度），
+    // 语义上正好是该槽位想要的"当前帧颜色可信度"⇒ **直接绑它**。
+    // 这是抑制拖影最有效的一步：DLSS 在半透明/粒子区域降低历史权重，
+    // 而不是把那些像素当作刚性几何持续累积（后者就是拖影）。
+    //
+    // 只有在拿不到任何纹理时才如实报告 no_masks（而不是假装绑了一个空的）。
+    // mask 来源（按可用性排序）：
+    //   ① transparency 槽位 —— 游戏这个合成 draw **没有**（7 个 SRV 已占满），恒为 null；
+    //   ② motion.b 合成的 reactive —— 在 motion 解码 CS 里顺带写出，实际可得。
+    // 只有当②也拿不到时才如实报告 no_masks（而不是假装绑了一个空的）。
+    // ⚠️ 实测否决（2026-11-09）：把 motion.b 合成成 reactive 并绑进
+    // `Bias.Current.Color.Mask` 之后，**K 的拖影没改善，M/L 反而也开始运动模糊**。
+    // 结论：`motion.b` 不是 DLSS 期望的 reactive 语义（NGX 的 bias mask 要求
+    // "当前帧颜色可信度 0..1"，而 motion.b 承载的是别的东西），硬绑只会让 DLSS
+    // 大范围降低历史权重 ⇒ 看起来像运动模糊。
+    // 因此这里**恢复不绑 mask**：宁可没有 mask（K 拖影，已知），
+    // 也不要错误语义的 mask（全模型运动模糊，更糟）。
+    //
+    // 真正的 transparency 槽位在这条合成 draw 上并不存在（日志实测 7 个 SRV
+    // 已被 color/weights/depth/motion/flags/out_meta/out_color 占满），
+    // 所以"正确语义的 mask"目前**没有来源** —— 这是已知缺口，写在这里备查。
+    const bool has_tc_tex = false;
+    // reactive mask（motion.b 合成）——**可配置重启**（2026-11-10）。
+    //
+    // 第 2 轮曾启用，结论是"K 无改善、M/L 反而糊了"，因此回退。
+    // ⚠️ 但那次测试的前提是**错误的**：当时 jitter 符号是 mode 3（错），
+    //    MV 也是负 scale（错）。整个时域系统都坏着，reactive 的效果无法归因。
+    // 现在 (jitter=0, motion=1) 已是正确基线，剩余问题正是
+    //    "低对比区域（白丝/白衣 vs 灰白地面）转动视角出拖影"
+    // ——这是 reactive mask 的**教科书适用场景**（颜色不可信 ⇒ 降历史权重）。
+    // 故重新引入，并做成开关，默认关（保持已验证基线不被破坏）。
+    const bool has_reactive_tex = (g_config.dlss_input_reactive_mask != 0) &&
+                                  (motion_decoded_reactive() != nullptr);
+    spec.mask = dlss_input::plan_masks([has_tc_tex, has_reactive_tex] {
+        dlss_input::MaskPlanInput m {};
+        m.has_reactive = has_reactive_tex;
+        m.has_transparency = has_tc_tex;
+        m.transparency = dlss_input::TransparencyHandling::Drop;
+        return m;
+    }());
+    if (has_tc_tex || has_reactive_tex)
+    {
+        spec.mask.bind_bias_mask = true;
+        if (has_tc_tex)
+            spec.mask.fold_transparency = true;
+    }
+    const dlss_input::FrameParams frame = dlss_input::build_frame(spec);
+
+    dlss_input::Feature::Desc desc {};
+    desc.render_w = frame.render_w;
+    desc.render_h = frame.render_h;
+    desc.display_w = frame.display_w;
+    desc.display_h = frame.display_h;
+    dlss_input::CreateFlagInput cf {};
+    cf.color = dlss_input::ColorEncoding::PqCodeValues; // 桥喂的是 PQ 码值
+    cf.depth_inverted = g_config.ffx12_depth_inverted;
+    cf.mvs_contain_jitter = g_config.fsr2_motion_vectors_jittered;
+    cf.mvs_at_display_resolution = false;
+    cf.have_exposure_texture = false;
+    cf.sharpening = in.enable_sharpening;
+    desc.flags = dlss_input::map_create_flags(cf);
+    desc.perf_quality = dlss_input::map_perf_quality(
+        static_cast<float>(display_w) / static_cast<float>(std::max(1u, in.render_w)),
+        /*avoid_ultra_quality_rewrite=*/true);    desc.bind_exposure_texture = false;
+
+    std::lock_guard lock(g_runtime_mutex);
+    // ⚠️ 这两个调用都会走进第三方（OptiScaler / NVIDIA NGX）的代码，而它们的
+    // 前置条件靠**约定**而非签名表达（已经踩过两次：参数顺序写反、context 传 null，
+    // 两次都是 READ 违例直接带走游戏进程）。所以统一用 SEH 兜底：
+    // 出错只让本次派发失败 → 回退 ffx，绝不崩游戏。
+    unsigned long crash_code = 0;
+    if (!ensure_feature_guarded(desc, context, &crash_code))
+    {
+        std::string detail = g_runtime.feature_error();
+        if (crash_code != 0)
+        {
+            char buf[64] {};
+            std::snprintf(buf, sizeof(buf), "crashed(0x%08lX) ", crash_code);
+            detail = std::string(buf) + detail;
+        }
+        LOG_WARN(blog::cat::upscale, "dlss_input_feature_failed error=" + detail);
+        g_path.store(0, std::memory_order_relaxed);
+        return false;
+    }
+
+    // 资源映射：桥的 FrameInput 里没有 reactive 的独立纹理（后端从 motion.b 合成），
+    // 这里如实传 nullptr —— 见 DLSS_INPUT.md §6.4 的"承认缺失"原则。
+    // 资源映射：桥的 FrameInput 里没有 reactive 的独立纹理（后端从 motion.b 合成），
+    // 这里如实传 nullptr —— 见 DLSS_INPUT.md §6.4 的"承认缺失"原则。
+    //
+    // 深度必须先提取成 R32_FLOAT（见 run_depth_extract 的注释：直接喂
+    // R32G8X24_TYPELESS 会让 DLSS 的遮挡判断失效 ⇒ 右上角远景鬼影）。
+    ID3D11Texture2D *depth_ready = run_depth_extract(device, context, in.depth);
+    // 运动矢量：必须解码（R10G10B10A2 平方编码 → R16G16_FLOAT），否则
+    // DLSS 按线性 UNORM 读会得到错误的运动量级/方向 ⇒ 运动后残留旧内容（鬼影）。
+    ID3D11Texture2D *motion_ready = run_motion_decode(device, context, in.motion, in.render_w, in.render_h);
+    // ★ 对照实验档（DlssInputMotionSign=3）：**不解码**，直接传原始 R10G10B10A2 motion。
+    //
+    // 为什么这档之前没被覆盖过：前几轮的 MotionSign=1 只改了 scale 符号，
+    // 解码始终开着 —— 于是"原始纹理 + 正 scale"这个组合从未被实测。
+    // 而它恰好是 FFX 路径（不拖影）与 OptiScaler 原生 FSR2 输入（不拖影）
+    // **共同使用**的组合：
+    //   FFX        : motion 原始 fmt=23 + scale=+2556
+    //   我的 DLSS  : motion 解码 fmt=34 + scale=-2556
+    // 若 DLSS 其实和 FFX 一样期望"原始平方编码纹理 + 正 scale"，那么
+    // 我这几轮的"解码 + 负 scale"就是双重错误，且两次错误互相掩盖。
+    if (g_config.dlss_input_motion_sign == 3)
+    {
+        static std::atomic_bool raw_mv_logged { false };
+        if (!raw_mv_logged.exchange(true, std::memory_order_relaxed))
+            LOG_INFO(blog::cat::upscale,
+                "dlss_mv_raw_passthrough: feeding undecoded motion + positive scale "
+                "(mirrors FFX/FSR2-input path)");
+        motion_ready = nullptr; // nullptr ⇒ 调用方回退到 in.motion 原始纹理
+    }
+    // reactive：与 MV 同一次 CS dispatch 写出（源 = motion.b）。这是这条 pass 上
+    // 唯一可得的 mask —— 没有它，DLSS 在运动/半透明区域会把旧内容当刚性几何累积，
+    // K（CNN 型，对 mask 最敏感）就表现为"一动就严重拖影模糊"。
+    ID3D11Texture2D *reactive_ready = (motion_ready != nullptr) ? motion_decoded_reactive() : nullptr;
+
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // ---- DLSS 路径输入转储（诊断构建，Fsr2InputDump=1 时生效）----
+    // 记录的是**实际交给 NGX 的那一份**（解码后的 depth/motion），而不是原始纹理：
+    // 排查"拖影"必须看 DLSS 真正收到什么，而不是源数据。
+    // 这一步只在诊断构建里存在，发布构建整块不编译（AGENTS.md §二.5：诊断默认关）。
+    {
+        fsr2dump::FrameDesc dd {};
+        dd.color = in.color;
+        dd.depth = (depth_ready != nullptr) ? depth_ready : in.depth;
+        dd.motion = (motion_ready != nullptr) ? motion_ready : in.motion;
+        dd.transparency = nullptr; // DLSS 路径没有该槽位
+        dd.output = in.output_target;
+        dd.render_w = in.render_w;
+        dd.render_h = in.render_h;
+        dd.display_w = display_w;
+        dd.display_h = display_h;
+        dd.jitter_x = frame.jitter_px;
+        dd.jitter_y = frame.jitter_py;
+        dd.motion_scale_x = frame.mv_scale_x;
+        dd.motion_scale_y = frame.mv_scale_y;
+        dd.frame_time_delta_ms = frame.frame_time_ms;
+        dd.use_reactive_mask = spec.mask.bind_bias_mask;
+        dd.use_transparency_mask = false;
+        dd.enable_sharpening = in.enable_sharpening;
+        dd.sharpness = frame.sharpness;
+        dd.reset = frame.reset != 0;
+        dd.frame_index = g_eval_total.load(std::memory_order_relaxed);
+        dd.instance = 0; // DLSS 路径统一单 feature，无 instance 概念
+        {
+            D3D11_TEXTURE2D_DESC td {};
+            if (dd.color != nullptr) { dd.color->GetDesc(&td); dd.fmt_color = static_cast<std::uint32_t>(td.Format); }
+            if (dd.depth != nullptr) { dd.depth->GetDesc(&td); dd.fmt_depth = static_cast<std::uint32_t>(td.Format); }
+            if (dd.motion != nullptr) { dd.motion->GetDesc(&td); dd.fmt_motion = static_cast<std::uint32_t>(td.Format); }
+            if (dd.output != nullptr) { dd.output->GetDesc(&td); dd.fmt_output = static_cast<std::uint32_t>(td.Format); }
+        }
+        fsr2dump::on_dispatch(context, dd, /*allow_readback=*/ true);
+    }
+#endif
+
+    const bool ok = evaluate_guarded(context, frame, in, spec.mask.bind_bias_mask,
+                                     depth_ready, motion_ready, reactive_ready, &crash_code);
+
+    if (!ok)
+    {
+        const std::uint32_t f = g_eval_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (f <= 8 || f % 256 == 0)
+        {
+            LOG_WARN(blog::cat::upscale,
+                "dlss_input_eval_failed count=" + std::to_string(f) +
+                " error=" + g_runtime.feature_error() +
+                " jitter_px=" + std::to_string(frame.jitter_px) +
+                " mv_scale=" + std::to_string(frame.mv_scale_x) +
+                " reset=" + std::to_string(frame.reset) +
+                " reason=" + frame.reset_reason);
+        }
+        return false;
+    }
+
+    // 低频取证：jitter/mvscale/reset 的真值（按需在 ini 里调等级）。
+    // `norm=` 记录**游戏原始归一化相位**——这是定位"jitter 冻结"的关键：
+    // 若 norm 每帧变化而 jitter_px 不变，问题在我们的换算；若 norm 本身就冻，
+    // 说明 il2cpp 字段偏移读错了（或游戏侧该字段不再更新）。
+    if (n <= 8 || n % 600 == 0)
+    {
+        // `render_calls` 是本帧累计的 il2cpp `FFX_FSR2::Render` 调用次数。
+        // 它是判定"抖动为什么不动"的**唯一**分水岭：
+        //   · render_calls 在涨、norm 不变 ⇒ 游戏侧 this+0x24 本身没更新
+        //     （字段语义/偏移问题，或游戏在某些场景复用同一相位）；
+        //   · render_calls 也不涨 ⇒ 钩子没被调到（il2cpp 特征识别失效/被绕过）。
+        // 没有这两个数字时，只能靠"gen 在涨"间接推断，会走弯路。
+        LOG_INFO(blog::cat::upscale,
+            "dlss_input_frame n=" + std::to_string(n) +
+            " render_calls=" + std::to_string(il2cpp_callsite::render_call_count()) +
+            " norm=" + std::to_string(norm_jx) + "," + std::to_string(norm_jy) +
+            " prev_norm=" + std::to_string(prev_norm[0]) + "," + std::to_string(prev_norm[1]) +
+            " jitter_px=" + std::to_string(frame.jitter_px) + "," + std::to_string(frame.jitter_py) +
+            " mv_scale=" + std::to_string(frame.mv_scale_x) + "," + std::to_string(frame.mv_scale_y) +
+            " pre_exp=" + std::to_string(frame.pre_exposure) +
+            " flags=0x" + hex64(desc.flags.flags) +
+            " pq=" + std::to_string(desc.perf_quality) +
+            " ratio=" + std::to_string(
+                static_cast<float>(display_w) / static_cast<float>(std::max(1u, in.render_w))) +
+            " reset=" + std::to_string(frame.reset) + "(" + frame.reset_reason + ")" +
+            " mask=" + std::string(spec.mask.note));
+    }
+    return true;
+}
+} // namespace dlss_gate
+
 // sdk234 未接管原因的低频诊断（2026-09-19：从 try_fsr2_translation_draw
 // 内抽出，该函数原约 1800 行）。
-//
 // **只读**：不修改任何状态机状态，只写自己的静态节流计数器 —— 因此可安全抽出，
 // 不会影响 dispatch/gate 语义。
 // 双入口第二次进入（同代次、刚派发过）不算异常，过滤掉。
@@ -12097,11 +13347,22 @@ bool try_fsr2_translation_draw(
                 sdk_in.reset = g_config.ffx12_force_reset || st->reset_next;
                 sdk_in.use_reactive_mask = g_config.fsr2_use_reactive_mask;
                 sdk_in.use_transparency_mask = g_config.fsr2_use_transparency_mask;
-                // RCAS 锐化：此前 `Fsr2SharpnessPercent` 只被读取、**从不使用**（与
-                // mv_decode / transparency / 硬编码 flags 同类的"配置存在但从未接线"死键）。
-                // 默认 0 ⇒ enable_sharpening=false，行为与现状一致；设 >0 才真正打开。
-                sdk_in.enable_sharpening = g_config.fsr2_sharpness_percent > 0;
-                sdk_in.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
+                // 锐化 —— **桥不参与，交给 OptiScaler 的 RCAS 后处理**（2026-11-10）。
+                //
+                // 实机证据链：
+                //   1) NGX 已废弃内置锐化：`nvsdk_ngx_defs.h:296` 的 `DoSharpening`
+                //      明确标注 "Sharpness is not supported"。
+                //   2) 用户在 OptiScaler 打开锐化后，游戏**正常运行但画面全黑**。
+                //      机制：废弃的 `DoSharpening` 位被传给 DLSS v310.7 ⇒ 未定义路径
+                //      ⇒ 输出无内容（不是崩溃，是管道跑通但画面空）。
+                //   3) OptiScaler 在 `DLSSFeature.cpp:14-22`（ProcessEvaluateParams）
+                //      里会覆盖 `Sharpness` 键：OverrideSharpness 且无 RCAS → 用它的值；
+                //      RCAS 启用 → 强制 0。⇒ 桥传什么都不会直接灌给 DLSS。
+                //
+                // 因此：桥恒不启用锐化；用户通过 OptiScaler 的
+                // `OverrideSharpness` / `Sharpness` / `[CAS] Enabled` 调整。
+                sdk_in.enable_sharpening = false;
+                sdk_in.sharpness = 0.0f;
                 // 接管空窗检测（2026-08-24 实证）：UI 全屏/场景切换由另一实例或原生接管，
                 // 距上次 dispatch 超 500ms（= 其他路径接管期）→ 恢复时强制 FSR2 reset，清历史残留。
                 {
@@ -12155,7 +13416,13 @@ bool try_fsr2_translation_draw(
                 //   槽1 = cb0[27].zw、槽2 = cb0[26].zw（其他着色器变体可能在此）
                 // 选变化槽：避免某视图槽位冻结导致 jitter 冻结 → 无 AA（第 16 轮 0x25FCE520 实证）。
                 // 都不变 = 该视图无相机抖动 → 无 AA 可累积（游戏原生同此）。
-                if (!render_jitter_valid)
+                // 闸门：只有 render 字段"无效"时才回退 cb0。
+                // 但实机证据（2026-11-09）：该字段**在 [0,1) 内一直"有效"，却在稳态下
+                // 每 600~1200 帧才更新一次**（n=600..6600 恒为 0.000342,0.000386，
+                // 而 render_calls 与帧号 1:1）。
+                // ⇒ "有效"不等于"逐帧变化"。诊断开关 DlssInputJitterProbe=1 时，
+                // 无论闸门如何都额外读一次 cb0 并对比，用来判定 cb0 是否才是逐帧真值。
+                if (!render_jitter_valid || g_config.dlss_input_jitter_probe)
                 {
                     ID3D11Buffer *bound_cb = nullptr;
                     context->PSGetConstantBuffers(0, 1, &bound_cb);
@@ -12249,6 +13516,29 @@ bool try_fsr2_translation_draw(
                                             }
                                         }
                                         const int pick = st->jit_locked ? st->jit_slot : 0;
+                                        // 探针：对比 cb0 与 render 字段，判定谁在逐帧变化。
+                                        // 只在 DlssInputJitterProbe=1 时打印，低频（前 8 次 + 每 300 次）。
+                                        if (g_config.dlss_input_jitter_probe)
+                                        {
+                                            static std::atomic_uint64_t jprobe_count { 0 };
+                                            const std::uint64_t jpc =
+                                                jprobe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                                            if (jpc <= 8 || jpc % 300 == 0)
+                                            {
+                                                LOG_INFO(blog::cat::upscale,
+                                                    "dlss_jitter_probe n=" + std::to_string(jpc) +
+                                                    " render=(" + std::to_string(call_params.jitter_x) + "," +
+                                                    std::to_string(call_params.jitter_y) + ")" +
+                                                    " cb0=(" + (ok[0] ? std::to_string(cb[0][0]) : std::string("--")) +
+                                                    "," + (ok[0] ? std::to_string(cb[0][1]) : std::string("--")) + ")" +
+                                                    " cb27=(" + (ok[1] ? std::to_string(cb[1][0]) : std::string("--")) +
+                                                    "," + (ok[1] ? std::to_string(cb[1][1]) : std::string("--")) + ")" +
+                                                    " cb26=(" + (ok[2] ? std::to_string(cb[2][0]) : std::string("--")) +
+                                                    "," + (ok[2] ? std::to_string(cb[2][1]) : std::string("--")) + ")" +
+                                                    " locked_slot=" + std::to_string(st->jit_slot) +
+                                                    " (which one changes per frame?)");
+                                            }
+                                        }
                                         if (ok[pick])
                                         {
                                             jit_src_x = cb[pick][0];
@@ -12308,6 +13598,12 @@ bool try_fsr2_translation_draw(
                         sdk_in.jitter_y = use_jy * static_cast<float>(sdk_in.render_h) - 0.5f;
                         break;
                 }
+                // ⚠️ 必须在**覆盖 prev_jx 之前**存下"上一帧"的相位。
+                // 此前 DLSS 分支在 13708 行读 st->prev_jx，而这一行在 13450 已经
+                // 把它更新成本帧值 ⇒ 读到的是当前帧，`Ffx12JitterDelay` 的补偿
+                // 在 DLSS 路径上完全失效（实机症状：运动中系统性拖影）。
+                const float prev_frame_jx = st->prev_jx;
+                const float prev_frame_jy = st->prev_jy;
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -12555,7 +13851,40 @@ bool try_fsr2_translation_draw(
                     st->dbg_depth = d_ptr;
                 }
 
-                if (ffx12::dispatch(sdk_in, context, call_params.instance))
+                // ---- 输出路由：ffx-api（现状）还是 NVSDK_NGX（DLSS 输入）----
+                //
+                // 两者是**互斥**的后端：同一帧只喂一条链路（同时喂会让两份历史互相污染，
+                // 而且两边的 reset/尺寸重建节奏不同）。`dispatch_ok` 统一承载成功与否，
+                // 失败 ⇒ 由下面原有的 fail-open 分支放行游戏原生 draw（不黑屏）。
+                bool dispatch_ok = false;
+                const bool use_dlss_input = dlss_gate::resolve_path() == 1;
+                if (use_dlss_input)
+                {
+                    // 与 ffx 路径共用同一份抓取结果；额外需要"游戏归一化 jitter"，
+                    // 它来自 il2cpp token（call_params.jitter_x/y 就是归一化相位）。
+                    const float prev_norm[2] { prev_frame_jx, prev_frame_jy };
+                    dispatch_ok = dlss_gate::dispatch(
+                        context, sdk_in,
+                        sdk_in.display_w, sdk_in.display_h,
+                        call_params.jitter_x, call_params.jitter_y, prev_norm,
+                        /*first_frame=*/ st->last_gen == 0,
+                        /*ms_since_last=*/ st->last_dispatch_tick != 0
+                            ? GetTickCount64() - st->last_dispatch_tick : 0);
+                    // 失败 ⇒ 永久退回 ffx（避免每帧在两条链路上抖动）。
+                    if (!dispatch_ok)
+                    {
+                        static std::atomic_bool dlss_fallback_logged { false };
+                        if (!dlss_fallback_logged.exchange(true, std::memory_order_relaxed))
+                            LOG_WARN(blog::cat::upscale,
+                                "dlss_input_fallback_to_ffx (permanent for this process)");
+                    }
+                }
+                else
+                {
+                    dispatch_ok = ffx12::dispatch(sdk_in, context, call_params.instance);
+                }
+
+                if (dispatch_ok)
                 {
                     // ---- 【功能 · B124】① 记下本路**自己的** color 采样来源 ----
                     // ⚠️ 这一行**不是诊断**：它是 B124 归属修法的"输入归属证据"
@@ -14932,6 +16261,7 @@ static void record_adapter_info(std::uint32_t vendor, const std::wstring &desc)
     char vendor_hex[16] {};
     std::snprintf(vendor_hex, sizeof(vendor_hex), "0x%04X", vendor);
     g_route_vendor_label = vendor_hex;
+    g_route_vendor_id.store(vendor, std::memory_order_relaxed);
     g_route_gpu_name = narrow(desc.c_str());
     g_route_sdk_path = narrow(g_config.ffx12_dll_path.c_str());
     g_route_applied = true;
