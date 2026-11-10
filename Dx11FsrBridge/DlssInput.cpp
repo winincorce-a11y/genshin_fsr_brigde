@@ -169,6 +169,31 @@ JitterOutput map_jitter(const JitterInput &in)
 
     float px = 0.0f;
     float py = 0.0f;
+
+    // ---- 相位归一（**必须在模式变换之前**）----
+    //
+    // 实测：游戏字段 norm 乘以 renderSize 后，`pix = norm*W` 在很多帧 **> 1**
+    // （实测样本 0.50 / 0.87 / 1.62 / 1.81 / 2.50 / 3.02）。而下面的
+    // `ZeroCentred` 用 `0.5 - pix`，pix=1.62 时得到 **-1.12**，pix=2.50 时
+    // 得到 **-2.00** —— 远超 NGX `Jitter.Offset` 的 |v| ≤ 0.5 契约。
+    //
+    // 旧实现在**模式变换之后**才用 `wrap_to_half_pixel` 折返，后果是
+    // **方向和量级都被破坏**（实测）：
+    //   jitter=-1.123 -> -0.123   （幅度压掉 9 倍）
+    //   jitter=-1.997 -> +0.003   （**方向翻转**）
+    //   jitter=-2.524 -> +0.476   （**方向翻转**）
+    // DLSS 因此每帧朝错误位置寻找历史 ⇒ **静止时画面也在抖**
+    //（用户实测：三渲二角色线条静止时也抖，M/L 比 K 明显）。
+    //
+    // 正确顺序：先把**相位**折回 [0,1)，再做模式变换。这样
+    // `0.5 - pix` 天然落在 (-0.5, +0.5]，契约恒成立，且方向不丢。
+    // 相位折返对序列是单射（模 1），多样性不受损。
+    if (in.mode != JitterMode::Zero && in.mode != JitterMode::Raw)
+    {
+        pix_x = pix_x - std::floor(pix_x);
+        pix_y = pix_y - std::floor(pix_y);
+    }
+
     switch (in.mode)
     {
     case JitterMode::PlusMinusHalf:
@@ -347,6 +372,15 @@ CreateFlagOutput map_create_flags(const CreateFlagInput &in)
     add(!in.mvs_at_display_resolution, kFlagMvLowRes, "mvs_at_render_resolution");
     // AutoExposure：只有真的绑了 1x1 exposure 纹理才能开。
     add(in.have_exposure_texture, kFlagAutoExposure, "exposure_texture_bound");
+
+    // AlphaUpscaling（1<<7）—— **实机 A/B 开关，默认关**。
+    // NVIDIA 官方头只给出这一位，没有任何语义注释；不臆测它的行为，
+    // 因此由 ini（DlssInputAlphaUpscaling）显式控制，并如实记入 reasons。
+    //
+    // 动机：三渲二角色的描边/头发/衣摆边缘是 alpha 混合或 alpha 裁切，
+    // 若 DLSS 把它们当作不透明刚性几何累积历史，边缘就会在时域里抖动。
+    // 若实机开启后线条抖动消失 => 这一位是有效解；变差则永久保持关闭。
+    add(in.alpha_upscaling, kFlagAlphaUpscaling, "alpha_upscaling_user_enabled");
 
     // ⚠️ **不再置 `DoSharpening`**（2026-11-10 修复"开锐化就黑屏"）。
     //

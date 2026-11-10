@@ -355,6 +355,14 @@ struct Config
     // 适用场景：低对比区域（白衣/白丝 vs 灰白地面）转动视角出拖影 ——
     // DLSS 靠颜色差异判断历史可信度，低对比时误判 ⇒ 需显式告知"此处不可信"。
     std::uint32_t dlss_input_reactive_mask = 0;
+    // AlphaUpscaling（NGX 1<<7）A/B 开关。默认 0=关。
+    // NVIDIA 官方头只有枚举、无语义说明，因此不作为默认行为，只供实机验证：
+    // 三渲二角色的描边/头发边缘是 alpha 混合，若 DLSS 当作不透明几何累积历史
+    // 就会在时域里抖动。开=1 若消除抖动则可考虑设默认，若变差则永久关闭。
+    std::uint32_t dlss_input_alpha_upscaling = 0;
+    // jitter 来源：0=游戏字段（默认，保持现状）1=自生成 Halton（推进且不重复）。
+    // 实测游戏字段在稳态下冻结（83 帧仅 14 个唯一相位），自生成可让 DLSS 真正收敛。
+    std::uint32_t dlss_input_jitter_source = 0;
     std::uint32_t dlss_input_motion_fixup = 0;  // 0=负 scale 1=要求原生符号纹理
     // 运动矢量符号 A/B 开关（排障用）：0=负 scale（默认）1=正 scale 2=关闭 MV。
     // 2 是**决定性诊断档**：若关闭后运动模糊消失，问题 100% 在 MV 链路；
@@ -4191,6 +4199,20 @@ void load_config()
     g_config.dlss_input_reactive_mask = std::clamp<std::uint32_t>(
         static_cast<std::uint32_t>(GetPrivateProfileIntW(
             L"Dx11FsrBridge", L"DlssInputReactiveMask", 0, config_path.c_str())),
+        0u,
+        1u);
+    // AlphaUpscaling A/B 开关（默认 0=关）。
+    g_config.dlss_input_alpha_upscaling = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputAlphaUpscaling", 0, config_path.c_str())),
+        0u,
+        1u);
+    // jitter 来源选择（0=游戏字段 1=自生成 Halton）。
+    // 实测：游戏字段稳态下只有 14/83 个唯一相位（冻结在极小范围），
+    // 自生成 Halton 单调推进，可让 DLSS 时域累积真正收敛。
+    g_config.dlss_input_jitter_source = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(GetPrivateProfileIntW(
+            L"Dx11FsrBridge", L"DlssInputJitterSource", 0, config_path.c_str())),
         0u,
         1u);
     g_config.dlss_input_motion_sign = std::clamp<std::uint32_t>(
@@ -11104,8 +11126,33 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     //
     // 这条约束比"相位是否冻结"重要得多：即使游戏字段更新慢，它至少是**真值**；
     // 自生成的是假值。所以这里回到使用游戏字段。
-    spec.jitter_semantics = dlss_input::JitterInput::NormSemantics::HaltonOverSize;
-    spec.jitter_frame_index = 0;
+    // ★ 2026-11-10 重新裁决（实测数据推翻旧结论）：
+    //
+    // 旧结论"必须用游戏字段，自生成会让 DLSS 找错历史"是在**当时那份坏基线**
+    // 上得出的（MV 符号、深度、jitter 相位当时都还没修）。修好其它缺陷后重新
+    // 实测，日志给出的事实是：
+    //
+    //   前 7 帧 jitter 完全匹配 Halton(2,3)：
+    //     0.000, 0.250, -0.250, 0.375, -0.125, 0.125, -0.375
+    //   第 8 帧起**脱轨**，稳态只在 -0.375 ~ -0.469 之间摆动：
+    //     -0.406 / -0.438 / -0.375 / -0.469  反复循环
+    //   83 帧统计：游戏字段只有 14 个唯一相位（17%），Halton 应为 83（100%）
+    //
+    // ⇒ 游戏在稳态下**不再推进亚像素相位**。DLSS 长期在同一小圈子里采样，
+    //   时域累积无法收敛 —— 这正是"三渲二角色线条**静止时也抖**"的机制
+    //   （与 alpha、MV 无关：那两项都已实测证伪）。
+    //
+    // 因此改为自生成 Halton：只要它**单调推进且不重复**，DLSS 就能真正收敛。
+    // 风险是它与游戏实际施加的相位不同步；但"冻结的真值"比"推进的合理值"
+    // 对时域累积更糟——后者至少能让 DLSS 收敛。若实机变差则回退
+    // DlssInputJitterSource=0。
+    const bool use_self_halton = (g_config.dlss_input_jitter_source == 1);
+    spec.jitter_semantics = use_self_halton
+        ? dlss_input::JitterInput::NormSemantics::SelfGeneratedHalton
+        : dlss_input::JitterInput::NormSemantics::HaltonOverSize;
+    spec.jitter_frame_index = use_self_halton
+        ? static_cast<int>(g_eval_total.load(std::memory_order_relaxed) + 1)
+        : 0;
     // ⚠️ **关键修复（2026-11-09，实机探针数据驱动）**
     //
     // `dlss_jitter_probe` 实测：游戏只施加**两个交替相位**
@@ -11231,6 +11278,7 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     cf.mvs_at_display_resolution = false;
     cf.have_exposure_texture = false;
     cf.sharpening = in.enable_sharpening;
+    cf.alpha_upscaling = (g_config.dlss_input_alpha_upscaling != 0);
     desc.flags = dlss_input::map_create_flags(cf);
     desc.perf_quality = dlss_input::map_perf_quality(
         static_cast<float>(display_w) / static_cast<float>(std::max(1u, in.render_w)),
@@ -11353,7 +11401,31 @@ bool dispatch(ID3D11DeviceContext *context, const ffx12::FrameInput &in,
     // `norm=` 记录**游戏原始归一化相位**——这是定位"jitter 冻结"的关键：
     // 若 norm 每帧变化而 jitter_px 不变，问题在我们的换算；若 norm 本身就冻，
     // 说明 il2cpp 字段偏移读错了（或游戏侧该字段不再更新）。
-    if (n <= 8 || n % 600 == 0)
+    // 日志门控：
+    //   默认（DlssInputJitterProbe=0）：前 8 帧 + 每 600 帧一条，够日常取证。
+    //   诊断（DlssInputJitterProbe=1）：按 **F11** 开始连续打印 200 帧。
+    //
+    // 为什么用热键而不是"一进游戏就连续打印"：桥在**登录界面**就已经开始
+    // 派发了，无条件的连续打印会把登录界面的 200 帧全部吃掉，等真正进游戏
+    // 时窗口已经用尽。F11 让采样窗口完全由用户控制
+    //（VK_F11 = 0x7A = 122）。
+    //
+    // 为什么要连续 200 帧：2026-11-10 实测出现过「norm 恒为 0.000342 但
+    // jitter_px 仍在 0.0032~0.1241 之间变化」，而原日志每 600 帧才一条 ⇒
+    // 无法判断是"norm 真冻结"还是"采样恰好撞上同一值"。
+    static std::atomic_uint64_t jitter_cadence_until { 0 };
+    const bool jitter_cadence_on = (g_config.dlss_input_jitter_probe != 0);
+    if (jitter_cadence_on && (GetAsyncKeyState(VK_F11) & 1))
+    {
+        // 每次按下 F11 重新开一个 200 帧的窗口
+        jitter_cadence_until.store(n + 200, std::memory_order_relaxed);
+        LOG_INFO(blog::cat::upscale,
+            "dlss_jitter_cadence_armed from_n=" + std::to_string(n) +
+            " frames=200 (press F11 again to re-arm)");
+    }
+    const std::uint64_t cadence_until = jitter_cadence_until.load(std::memory_order_relaxed);
+    const bool cadence_active = jitter_cadence_on && cadence_until != 0 && n <= cadence_until;
+    if (n <= 8 || n % 600 == 0 || cadence_active)
     {
         // `render_calls` 是本帧累计的 il2cpp `FFX_FSR2::Render` 调用次数。
         // 它是判定"抖动为什么不动"的**唯一**分水岭：

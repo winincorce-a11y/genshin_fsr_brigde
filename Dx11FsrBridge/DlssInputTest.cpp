@@ -172,29 +172,103 @@ void test_jitter_modes_and_phase_compensation()
     in.reduce = JitterReduce::None;
     in.semantics = JitterInput::NormSemantics::RawPhase;
 
+    // ★ 2026-11-10 修复：相位**在模式变换之前**折回 [0,1)。
+    // 旧行为允许 `0.5 - pix` 输出远超 ±0.5（实测 -1.12 / -2.00 / -2.52），
+    // 破坏 NGX 的 Jitter.Offset 契约；而事后再 wrap 会翻转方向，
+    // 表现就是"静止时线条也抖"。这里的断言钉住修复后的行为。
+    //
+    // norm=0.25, render_w=1000 => pix=250 => 折回 0 => ZeroCentred 得 0.5
     in.mode = JitterMode::ZeroCentred;
     JitterOutput o = map_jitter(in);
-    CHECK_NEAR(o.px, -(0.25f * 1000.0f) + 0.5f);
+    CHECK_NEAR(o.px, 0.5f);
     CHECK(o.source == std::string("render"));
 
+    // Negative：-pix 折回后仍为 -0.0（相位域 0）
     in.mode = JitterMode::Negative;
     o = map_jitter(in);
-    CHECK_NEAR(o.px, -250.0f);
+    CHECK_NEAR(o.px, 0.0f);
 
     in.mode = JitterMode::Zero;
     CHECK_NEAR(map_jitter(in).px, 0.0f);
 
+    // cb 落后一帧 + prev_norm=0.5 => pix=500 => 折回 0 => 0.5
     in.mode = JitterMode::ZeroCentred;
     in.cb_lags_one_frame = true;
     in.prev_norm_x = 0.5f;
     in.prev_norm_y = 0.5f;
     o = map_jitter(in);
     CHECK(o.source == std::string("cb_prev"));
-    CHECK_NEAR(o.px, -(0.5f * 1000.0f) + 0.5f);
+    CHECK_NEAR(o.px, 0.5f);
 
     JitterInput bad = in;
     bad.render_w = 0;
     CHECK(!map_jitter(bad).valid);
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+void test_jitter_contract_bounds()
+{
+    std::printf("[3b] jitter: |offset| must stay within the NGX contract\n");
+
+    // ★ 实机回归（2026-11-10）：三渲二角色线条**静止时也抖**。
+    //
+    // 根因不在 alpha，而在相位未被归一：游戏字段 norm 乘以 renderSize 后
+    // 实测出现过 pix = 1.62 / 1.81 / 2.50 / 3.02，而 `0.5 - pix` 随即输出
+    // -1.12 / -1.31 / -2.00 / -2.52 —— 远超 NGX 要求的 |Jitter.Offset| ≤ 0.5。
+    // 旧实现在模式变换**之后**才 wrap，把 -1.997 折成 +0.003（**方向翻转**），
+    // DLSS 因此每帧朝错误位置找历史 ⇒ 静止也抖。
+    //
+    // 这组断言用实测出现过的 norm 值钉住"相位先折回、再做模式变换"的顺序。
+    const unsigned W = 2556, H = 1438;
+    const float observed_norms[][2] = {
+        { 0.000196f, 0.000232f }, { 0.000342f, 0.000386f },
+        { 0.000635f, 0.000977f }, { 0.000708f, 0.001183f },
+        { 0.000977f, 0.001183f }, { 0.001183f, 0.000635f },
+    };
+    const JitterMode modes[] = { JitterMode::ZeroCentred, JitterMode::PlusMinusHalf,
+                                 JitterMode::Negative, JitterMode::Positive };
+    for (int m = 0; m < 4; ++m)
+    {
+        for (int i = 0; i < 6; ++i)
+        {
+            JitterInput in {};
+            in.render_w = W;
+            in.render_h = H;
+            in.mode = modes[m];
+            in.reduce = JitterReduce::PhaseScaled;
+            in.semantics = JitterInput::NormSemantics::HaltonOverSize;
+            in.norm_x = observed_norms[i][0];
+            in.norm_y = observed_norms[i][1];
+            const JitterOutput o = map_jitter(in);
+            CHECK(o.valid);
+            // NGX 契约：严格落在 [-0.5, +0.5]
+            CHECK(o.px >= -0.5f && o.px <= 0.5f);
+            CHECK(o.py >= -0.5f && o.py <= 0.5f);
+            // 说明：`raw_px/raw_py` 是**折回之前**的原始值，故意不设上下界
+            // （它的作用就是让诊断日志能看到"原始值越界了多少"）。
+            // 只有实际送出去的 `px/py` 受 NGX 契约约束 —— 即上面两条断言。
+        }
+    }
+
+    // 方向不能因折返而翻转：pix 从 0.9 增到 1.1 时，ZeroCentred 的输出
+    //   0.5-0.9 = -0.4 ；0.5-1.1 = -0.6 -> 折回后相位 0.1 -> +0.4
+    // 这是**相位域**的正确行为（跨过一个完整周期），而不是空间方向的翻转。
+    // 用同周期的两个相位验证连续性：pix=1.2 与 pix=1.8 应给出 0.5-0.2 与 0.5-0.8
+    {
+        JitterInput a {};
+        a.render_w = 1000; a.render_h = 1000;
+        a.mode = JitterMode::ZeroCentred;
+        a.reduce = JitterReduce::PhaseScaled;
+        a.semantics = JitterInput::NormSemantics::HaltonOverSize;
+        a.norm_x = 0.0012f; // pix = 1.2 -> 相位 0.2
+        a.norm_y = 0.0012f;
+        CHECK_NEAR(map_jitter(a).px, 0.3f);
+
+        a.norm_x = 0.0018f; // pix = 1.8 -> 相位 0.8
+        a.norm_y = 0.0018f;
+        CHECK_NEAR(map_jitter(a).px, -0.3f);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +579,9 @@ void test_build_frame()
     CHECK(f.render_w == 1280 && f.render_h == 720);
     CHECK(f.display_w == 1920 && f.display_h == 1080);
     CHECK(f.render_subrect.w == 1280 && f.render_subrect.h == 720);
-    CHECK_NEAR(f.jitter_px, -(0.25f * 1280.0f) + 0.5f);
+    // ★ 相位先折回 [0,1) 再变换：norm=0.25, w=1280 => pix=320 => 折回 0
+    //   => ZeroCentred 得 0.5（旧断言把越界当正确，已更新）
+    CHECK_NEAR(f.jitter_px, 0.5f);
     CHECK_NEAR(f.mv_scale_x, -1280.0f);
     CHECK(f.reset == 1);
     CHECK(f.reset_reason == std::string("first_frame"));
@@ -615,6 +691,7 @@ int main()
     test_jitter_modes();
     test_jitter_wrap_math();
     test_jitter_modes_and_phase_compensation();
+    test_jitter_contract_bounds();
     test_motion_sign();
     test_create_flags();
     test_perf_quality();

@@ -274,6 +274,11 @@ struct CreateFlagInput
     bool mvs_at_display_resolution = false;
     bool have_exposure_texture = false; // 有 1x1 exposure 才能开 AutoExposure
     bool sharpening = false;            // 内置锐化（桥用 RCAS 时不设，避免双重锐化）
+    // AlphaUpscaling（1<<7）：NVIDIA 官方头只有枚举、**没有任何语义说明**，
+    // 因此不猜它的行为——只暴露成开关做实机 A/B，默认关。
+    // 候选用途：让 DLSS 正确处理 alpha 混合边缘（三渲二描边 / 头发边缘）。
+    // 实测有效才考虑改默认；无效则永久保持关闭。
+    bool alpha_upscaling = false;
 };
 
 struct CreateFlagOutput
