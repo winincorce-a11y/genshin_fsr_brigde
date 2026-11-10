@@ -123,6 +123,7 @@ add_library(Dx11FsrBridge SHARED
     Il2CppCallSiteHook.cpp
     TransparentJitterHook.cpp
     Ffx12Backend.cpp
+    DlssInput.cpp
 )
 
 # ⚠️ `Fsr2InputDump.cpp`（抓帧诊断）**只在诊断构建里**进源列表：
@@ -304,8 +305,23 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     target_include_directories(TransparentJitterHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME TransparentJitterHookTest COMMAND TransparentJitterHookTest)
 
-    # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----
+    # DLSS 输入契约的纯映射层单测：jitter（wrap vs clamp 的多样性差异、cb0 一帧相位补偿）、
+    # motion（FSR2 纹理 → NGX 的符号抵消）、create flags（PQ 码值不得标成 IsHDR）、
+    # perf quality（UltraQuality 被 OptiScaler 改写时的规避）、reset 优先级、
+    # mask（transparency 无槽位时必须承认丢失）、subrect 越界、输出路由。
     #
+    # ⚠️ 本 target **不需要 GPU、不需要游戏、不需要 nvngx.dll、不链接 Detours**：
+    #   `DlssInput.cpp` 的驱动层用 `#if defined(_WIN32)` 与前置声明隔离，
+    #   纯映射层零依赖 ⇒ 这是唯一能在 CI/无 N 卡的机器上钉住"N 卡语义"的测试。
+    add_executable(DlssInputTest
+        DlssInputTest.cpp
+        DlssInput.cpp
+    )
+    fsrbridge_configure_test(DlssInputTest)
+    target_include_directories(DlssInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME DlssInputTest COMMAND DlssInputTest)
+
+    # ---- 以下两个 test target 是**诊断专用**，随诊断开关一起排除 ----    #
     # ⚠️ 必须一起排除，否则发布构建会挂：`PerfProbeTest` 要测 `perf_probe::read_*` /
     # `reset_for_test` / 直方图；`Fsr2InputDumpTest` 要链 `Fsr2InputDump.cpp`——
     # 两者在发布构建里**根本不存在**（诊断核心被 `#if` 排除、诊断 .cpp 不在源列表里）。
